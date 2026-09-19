@@ -1960,7 +1960,7 @@ def buckets_page():
 </tr>
 """
 
-    content = f"""
+    content = """
 <h2>🪣 Buckets</h2>
 
 <div class="card">
@@ -2000,9 +2000,22 @@ placeholder="Capacity">
 
 <script>
 
-async function addBucket(){
+async function addBucket() {{
 
-    async function addBucket() {
+    const name = document.getElementById("name").value;
+
+    const capacity = document.getElementById("capacity").value;
+
+    const r = await fetch("/api/buckets", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            name: name,
+            capacity: capacity
+        })
+    });
 
     const name = document.getElementById("name").value;
 
@@ -2022,7 +2035,7 @@ async function addBucket(){
     const d = await r.json();
 
     if (d.ok) {
-        location.reload();
+        window.location.reload();
     } else {
         alert(d.error);
     }
@@ -2139,7 +2152,7 @@ def settings_page():
         "55"
     )
 
-    content = f"""
+    content = """
 <h2>⚙️ Settings</h2>
 
 <div class="card">
@@ -2169,8 +2182,7 @@ value="{line}">
 
 async function saveSettings(){
 
-    const line =
-        document.getElementById(
+    const line = document.getElementById(
             "line"
         ).value;
 
@@ -2851,8 +2863,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/train":
 
-                summary =
-                    get_dataset_summary()
+                summary =  get_dataset_summary()
 
                 if summary["labeled_images"] < 5:
 
@@ -3031,25 +3042,20 @@ class Handler(BaseHTTPRequestHandler):
                         ):
                             continue
 
-                        class_name =
-                            CLASSES[cls_id]
+                        class_name = CLASSES[cls_id]
 
-                        x1,y1,x2,y2 =
-                            box.xyxy[0].tolist()
+                        x1,y1,x2,y2 = box.xyxy[0].tolist()
 
-                        center_y =
-                            (y1+y2)/2
+                        center_y = (y1+y2)/2
 
-                        line_position =
-                            int(
+                        line_position = int(
                                 setting(
                                     "line_position",
                                     "55"
                                 )
                             )
 
-                        line_y =
-                            frame.shape[0] * (
+                        line_y = frame.shape[0] * (
                                 line_position / 100
                             )
 
