@@ -76,6 +76,13 @@ def init_db():
         )
     """)
 
+    # Existing table may have been created before "labeled"
+    # was added. This keeps old data safe.
+    cur.execute("""
+        ALTER TABLE dataset_images
+        ADD COLUMN IF NOT EXISTS labeled BOOLEAN DEFAULT FALSE
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS annotations (
             id BIGSERIAL PRIMARY KEY,
@@ -123,8 +130,24 @@ def init_db():
     cur.execute("""
         INSERT INTO training_state
         (id, status, progress, message)
-        VALUES (1, 'NOT_STARTED', 0, 'Training has not started')
+        VALUES (
+            1,
+            'WAITING',
+            0,
+            'Ready for external YOLO training'
+        )
         ON CONFLICT (id) DO NOTHING
+    """)
+
+    # Mark images with existing annotations as labeled.
+    cur.execute("""
+        UPDATE dataset_images
+        SET labeled = TRUE
+        WHERE id IN (
+            SELECT DISTINCT image_id
+            FROM annotations
+        )
+        AND labeled IS NOT TRUE
     """)
 
     conn.commit()
@@ -194,9 +217,9 @@ def get_training_state():
 
     if not row:
         return {
-            "status": "NOT_STARTED",
+            "status": "WAITING",
             "progress": 0,
-            "message": "Training has not started"
+            "message": "Ready for external YOLO training"
         }
 
     return row
@@ -249,6 +272,7 @@ def model_ready():
 # =========================================================
 
 def send_json(handler, data, status=200):
+
     body = json.dumps(
         data,
         ensure_ascii=False,
@@ -257,19 +281,24 @@ def send_json(handler, data, status=200):
 
     try:
         handler.send_response(status)
+
         handler.send_header(
             "Content-Type",
             "application/json; charset=utf-8"
         )
+
         handler.send_header(
             "Content-Length",
             str(len(body))
         )
+
         handler.send_header(
             "Cache-Control",
             "no-store"
         )
+
         handler.end_headers()
+
         handler.wfile.write(body)
 
     except BrokenPipeError:
@@ -280,7 +309,13 @@ def send_json(handler, data, status=200):
 
 
 def read_json(handler):
-    length = int(handler.headers.get("Content-Length", "0"))
+
+    length = int(
+        handler.headers.get(
+            "Content-Length",
+            "0"
+        )
+    )
 
     if length <= 0:
         return {}
@@ -290,11 +325,31 @@ def read_json(handler):
     if not raw:
         return {}
 
-    return json.loads(raw.decode("utf-8"))
+    return json.loads(
+        raw.decode("utf-8")
+    )
 
 
 # =========================================================
-# HTML
+# IMAGE DATA
+# =========================================================
+
+def decode_image_data(data_url):
+
+    if not data_url:
+        raise ValueError("Image data is missing.")
+
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+
+    try:
+        return base64.b64decode(data_url)
+    except Exception:
+        raise ValueError("Invalid image data.")
+
+
+# =========================================================
+# HTML LAYOUT
 # =========================================================
 
 def layout(title, content):
@@ -302,6 +357,7 @@ def layout(title, content):
     return f"""
 <!DOCTYPE html>
 <html>
+
 <head>
 
 <meta charset="UTF-8">
@@ -418,6 +474,14 @@ button:hover {{
     opacity: 0.9;
 }}
 
+button.secondary {{
+    background: #4b5563;
+}}
+
+button.danger {{
+    background: #b91c1c;
+}}
+
 table {{
     width: 100%;
     border-collapse: collapse;
@@ -459,6 +523,70 @@ footer {{
     color: #666;
 }}
 
+.training-canvas {{
+    width: 100%;
+    max-width: 900px;
+    border: 2px solid #111827;
+    border-radius: 10px;
+    display: block;
+    background: #111;
+    touch-action: none;
+}}
+
+.info {{
+    padding: 12px;
+    background: #eef2ff;
+    border-radius: 8px;
+    margin: 10px 0;
+}}
+
+.success {{
+    padding: 12px;
+    background: #dcfce7;
+    border-radius: 8px;
+    margin: 10px 0;
+}}
+
+.warning {{
+    padding: 12px;
+    background: #fef3c7;
+    border-radius: 8px;
+    margin: 10px 0;
+}}
+
+.small {{
+    font-size: 13px;
+    color: #666;
+}}
+
+.box-list {{
+    margin-top: 15px;
+}}
+
+.box-item {{
+    background: #f3f4f6;
+    padding: 10px;
+    border-radius: 7px;
+    margin: 6px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}}
+
+.box-item button {{
+    width: auto;
+    margin: 0;
+    padding: 7px 10px;
+}}
+
+.camera-preview {{
+    width: 100%;
+    max-width: 900px;
+    background: #000;
+    border-radius: 10px;
+}}
+
 </style>
 
 </head>
@@ -497,6 +625,7 @@ Geology & Mining Services
 </footer>
 
 </body>
+
 </html>
 """
 
@@ -575,7 +704,10 @@ style="width:{state["progress"]}%">
 </div>
 """
 
-    return layout("Dashboard", content)
+    return layout(
+        "Dashboard",
+        content
+    )
 
 
 # =========================================================
@@ -657,39 +789,43 @@ async function addBucket() {{
         return;
     }}
 
-    const r = await fetch("/api/buckets", {{
-
-        method: "POST",
-
-        headers: {{
-            "Content-Type": "application/json"
-        }},
-
-        body: JSON.stringify({{
-            name: name,
-            capacity: capacity
-        }})
-
-    }});
+    const r = await fetch(
+        "/api/buckets",
+        {{
+            method: "POST",
+            headers: {{
+                "Content-Type": "application/json"
+            }},
+            body: JSON.stringify({{
+                name: name,
+                capacity: capacity
+            }})
+        }}
+    );
 
     const d = await r.json();
 
     if (d.ok) {{
-
         window.location.reload();
-
     }} else {{
-
-        alert(d.error || "Failed to add bucket");
-
+        alert(
+            d.error ||
+            "Failed to add bucket"
+        );
     }}
 
 }}
 
 </script>
-""".replace("{ROWS}", rows)
+""".replace(
+        "{ROWS}",
+        rows
+    )
 
-    return layout("Buckets", content)
+    return layout(
+        "Buckets",
+        content
+    )
 
 
 # =========================================================
@@ -740,26 +876,164 @@ Model:
 
 </div>
 
+
+<!-- =====================================================
+     ADD TRAINING IMAGE
+====================================================== -->
+
+<div class="card">
+
+<h3>➕ Add Training Image</h3>
+
+<div class="info">
+
+<p>
+Piga picha au chagua picha kutoka kwenye simu/computer.
+Kisha chora box kuzunguka object unayotaka AI ijifunze.
+</p>
+
+<p class="small">
+Unaweza kuweka objects nyingi kwenye picha moja.
+Mfano: bucket loaded 1 + bucket loaded 2 + person 1.
+</p>
+
+</div>
+
+<input
+type="file"
+id="imageFile"
+accept="image/*"
+capture="environment"
+onchange="loadTrainingImage(event)">
+
+<button
+type="button"
+onclick="openCamera()">
+
+📷 OPEN CAMERA
+
+</button>
+
+<video
+id="trainingVideo"
+class="camera-preview"
+autoplay
+playsinline
+style="display:none;">
+
+</video>
+
+<button
+id="captureButton"
+type="button"
+style="display:none;"
+onclick="captureCameraPhoto()">
+
+📸 CAPTURE PHOTO
+
+</button>
+
+<canvas
+id="trainingCanvas"
+class="training-canvas"
+style="display:none;">
+
+</canvas>
+
+<div
+id="trainingInfo"
+class="info"
+style="display:none;">
+
+Chagua class kisha chora box kwenye picha.
+
+</div>
+
+<label>
+<b>Class:</b>
+</label>
+
+<select id="classSelect">
+
+<option value="BUCKET_LOADED">
+BUCKET_LOADED — COUNT
+</option>
+
+<option value="BUCKET_EMPTY">
+BUCKET_EMPTY — NO COUNT
+</option>
+
+<option value="PEOPLE">
+PEOPLE — NO COUNT
+</option>
+
+<option value="EQUIPMENT">
+EQUIPMENT — NO COUNT
+</option>
+
+</select>
+
+<button
+type="button"
+onclick="clearBoxes">
+
+🗑️ CLEAR ALL BOXES
+</button>
+
+<div id="boxList" class="box-list"></div>
+
+<button
+id="saveTrainingButton"
+type="button"
+onclick="saveTrainingImage()"
+style="display:none;">
+
+💾 SAVE TRAINING IMAGE
+
+</button>
+
+<p
+id="saveResult">
+</p>
+
+</div>
+
+
+<!-- =====================================================
+     DATASET
+====================================================== -->
+
 <div class="card">
 
 <h3>Dataset</h3>
 
 <p>
 Total images:
-<b>{summary["total_images"]}</b>
+<b id="totalImages">
+{summary["total_images"]}
+</b>
 </p>
 
 <p>
 Labeled:
-<b>{summary["labeled_images"]}</b>
+<b id="labeledImages">
+{summary["labeled_images"]}
+</b>
 </p>
 
 <p>
 Annotations:
-<b>{summary["annotations"]}</b>
+<b id="annotationCount">
+{summary["annotations"]}
+</b>
 </p>
 
 </div>
+
+
+<!-- =====================================================
+     TRAINING STATUS
+====================================================== -->
 
 <div class="card">
 
@@ -784,6 +1058,7 @@ style="width:{state["progress"]}%">
 
 </div>
 
+
 <div class="card">
 
 <h3>⚠️ Training</h3>
@@ -806,27 +1081,987 @@ will use it for bucket detection.
 
 </div>
 
+
 <script>
+
+let trainingImage = null;
+let trainingImageName = "";
+let canvas = null;
+let ctx = null;
+let boxes = [];
+
+let drawing = false;
+let startX = 0;
+let startY = 0;
+let currentX = 0;
+let currentY = 0;
+
+let cameraStream = null;
+
+
+// =====================================================
+// LOAD IMAGE
+// =====================================================
+
+function loadTrainingImage(event) {{
+
+    const file =
+        event.target.files[0];
+
+    if (!file) {{
+        return;
+    }}
+
+    trainingImageName =
+        file.name || "training_image.jpg";
+
+    const reader =
+        new FileReader();
+
+    reader.onload = function(e) {{
+
+        const img =
+            new Image();
+
+        img.onload = function() {{
+
+            trainingImage = img;
+
+            showTrainingCanvas();
+
+        }};
+
+        img.src = e.target.result;
+
+    }};
+
+    reader.readAsDataURL(file);
+
+}}
+
+
+// =====================================================
+// SHOW CANVAS
+// =====================================================
+
+function showTrainingCanvas() {{
+
+    canvas =
+        document.getElementById(
+            "trainingCanvas"
+        );
+
+    ctx =
+        canvas.getContext("2d");
+
+    let maxWidth =
+        Math.min(
+            window.innerWidth - 50,
+            900
+        );
+
+    let scale =
+        maxWidth /
+        trainingImage.width;
+
+    if (scale > 1) {{
+        scale = 1;
+    }}
+
+    canvas.width =
+        Math.round(
+            trainingImage.width * scale
+        );
+
+    canvas.height =
+        Math.round(
+            trainingImage.height * scale
+        );
+
+    canvas.style.display =
+        "block";
+
+    document.getElementById(
+        "trainingInfo"
+    ).style.display =
+        "block";
+
+    document.getElementById(
+        "saveTrainingButton"
+    ).style.display =
+        "block";
+
+    boxes = [];
+
+    redrawCanvas();
+
+    updateBoxList();
+
+}}
+
+
+// =====================================================
+// DRAW IMAGE + BOXES
+// =====================================================
+
+function redrawCanvas() {{
+
+    if (!canvas || !trainingImage) {{
+        return;
+    }}
+
+    ctx.clearRect(
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+    ctx.drawImage(
+        trainingImage,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+    for (
+        let i = 0;
+        i < boxes.length;
+        i++
+    ) {{
+
+        const b = boxes[i];
+
+        const x =
+            b.x1 * canvas.width;
+
+        const y =
+            b.y1 * canvas.height;
+
+        const w =
+            (b.x2 - b.x1) *
+            canvas.width;
+
+        const h =
+            (b.y2 - b.y1) *
+            canvas.height;
+
+        ctx.strokeStyle =
+            "#ff0000";
+
+        ctx.lineWidth = 3;
+
+        ctx.strokeRect(
+            x,
+            y,
+            w,
+            h
+        );
+
+        ctx.fillStyle =
+            "rgba(255,0,0,0.25)";
+
+        ctx.fillRect(
+            x,
+            y,
+            w,
+            h
+        );
+
+        ctx.fillStyle =
+            "#ffffff";
+
+        ctx.font =
+            "bold 14px Arial";
+
+        ctx.fillText(
+            b.class_name,
+            x + 5,
+            y + 18
+        );
+
+    }}
+
+    if (drawing) {{
+
+        const x =
+            Math.min(
+                startX,
+                currentX
+            );
+
+        const y =
+            Math.min(
+                startY,
+                currentY
+            );
+
+        const w =
+            Math.abs(
+                currentX - startX
+            );
+
+        const h =
+            Math.abs(
+                currentY - startY
+            );
+
+        ctx.strokeStyle =
+            "#00ff00";
+
+        ctx.lineWidth = 3;
+
+        ctx.strokeRect(
+            x,
+            y,
+            w,
+            h
+        );
+
+    }}
+
+}}
+
+
+// =====================================================
+// POINTER POSITION
+// =====================================================
+
+function getPointerPosition(event) {{
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    let clientX;
+    let clientY;
+
+    if (
+        event.touches &&
+        event.touches.length
+    ) {{
+
+        clientX =
+            event.touches[0].clientX;
+
+        clientY =
+            event.touches[0].clientY;
+
+    }} else {{
+
+        clientX =
+            event.clientX;
+
+        clientY =
+            event.clientY;
+
+    }}
+
+    let x =
+        (clientX - rect.left) /
+        rect.width;
+
+    let y =
+        (clientY - rect.top) /
+        rect.height;
+
+    x =
+        Math.max(
+            0,
+            Math.min(1, x)
+        );
+
+    y =
+        Math.max(
+            0,
+            Math.min(1, y)
+        );
+
+    return {{
+        x: x,
+        y: y
+    }};
+
+}}
+
+
+// =====================================================
+// START DRAW
+// =====================================================
+
+function startDrawing(event) {{
+
+    if (!canvas) {{
+        return;
+    }}
+
+    event.preventDefault();
+
+    const p =
+        getPointerPosition(event);
+
+    startX =
+        p.x * canvas.width;
+
+    startY =
+        p.y * canvas.height;
+
+    currentX =
+        startX;
+
+    currentY =
+        startY;
+
+    drawing = true;
+
+}}
+
+
+// =====================================================
+// MOVE DRAW
+// =====================================================
+
+function moveDrawing(event) {{
+
+    if (!drawing) {{
+        return;
+    }}
+
+    event.preventDefault();
+
+    const p =
+        getPointerPosition(event);
+
+    currentX =
+        p.x * canvas.width;
+
+    currentY =
+        p.y * canvas.height;
+
+    redrawCanvas();
+
+}}
+
+
+// =====================================================
+// FINISH DRAW
+// =====================================================
+
+function finishDrawing(event) {{
+
+    if (!drawing) {{
+        return;
+    }}
+
+    event.preventDefault();
+
+    const p =
+        getPointerPosition(event);
+
+    currentX =
+        p.x * canvas.width;
+
+    currentY =
+        p.y * canvas.height;
+
+    drawing = false;
+
+    let x1 =
+        Math.min(
+            startX,
+            currentX
+        ) / canvas.width;
+
+    let y1 =
+        Math.min(
+            startY,
+            currentY
+        ) / canvas.height;
+
+    let x2 =
+        Math.max(
+            startX,
+            currentX
+        ) / canvas.width;
+
+    let y2 =
+        Math.max(
+            startY,
+            currentY
+        ) / canvas.height;
+
+    const minSize = 0.01;
+
+    if (
+        (x2 - x1) < minSize ||
+        (y2 - y1) < minSize
+    ) {{
+
+        redrawCanvas();
+
+        return;
+    }}
+
+    boxes.push({{
+        class_name:
+            document.getElementById(
+                "classSelect"
+            ).value,
+
+        x1: x1,
+        y1: y1,
+        x2: x2,
+        y2: y2
+    }});
+
+    redrawCanvas();
+
+    updateBoxList();
+
+}}
+
+
+// =====================================================
+// CANVAS EVENTS
+// =====================================================
+
+function setupCanvasEvents() {{
+
+    canvas.addEventListener(
+        "mousedown",
+        startDrawing
+    );
+
+    canvas.addEventListener(
+        "mousemove",
+        moveDrawing
+    );
+
+    canvas.addEventListener(
+        "mouseup",
+        finishDrawing
+    );
+
+    canvas.addEventListener(
+        "mouseleave",
+        finishDrawing
+    );
+
+    canvas.addEventListener(
+        "touchstart",
+        startDrawing,
+        {{ passive: false }}
+    );
+
+    canvas.addEventListener(
+        "touchmove",
+        moveDrawing,
+        {{ passive: false }}
+    );
+
+    canvas.addEventListener(
+        "touchend",
+        finishDrawing,
+        {{ passive: false }}
+    );
+
+}}
+
+document.addEventListener(
+    "DOMContentLoaded",
+    function() {{
+
+        canvas =
+            document.getElementById(
+                "trainingCanvas"
+            );
+
+        setupCanvasEvents();
+
+    }}
+);
+
+
+// =====================================================
+// BOX LIST
+// =====================================================
+
+function updateBoxList() {{
+
+    const list =
+        document.getElementById(
+            "boxList"
+        );
+
+    if (!boxes.length) {{
+
+        list.innerHTML =
+            "<p class='small'>No boxes yet.</p>";
+
+        return;
+    }}
+
+    let html = "";
+
+    for (
+        let i = 0;
+        i < boxes.length;
+        i++
+    ) {{
+
+        html +=
+            "<div class='box-item'>" +
+
+            "<span>" +
+            (i + 1) +
+            ". " +
+            boxes[i].class_name +
+            "</span>" +
+
+            "<button " +
+            "type='button' " +
+            "onclick='deleteBox(" +
+            i +
+            ")'>" +
+
+            "Delete" +
+
+            "</button>" +
+
+            "</div>";
+
+    }}
+
+    list.innerHTML = html;
+
+}}
+
+
+// =====================================================
+// DELETE BOX
+// =====================================================
+
+function deleteBox(index) {{
+
+    boxes.splice(
+        index,
+        1
+    );
+
+    redrawCanvas();
+
+    updateBoxList();
+
+}}
+
+
+// =====================================================
+// CLEAR BOXES
+// =====================================================
+
+function clearBoxes() {{
+
+    boxes = [];
+
+    redrawCanvas();
+
+    updateBoxList();
+
+}}
+
+
+// =====================================================
+// CAMERA
+// =====================================================
+
+async function openCamera() {{
+
+    try {{
+
+        const video =
+            document.getElementById(
+                "trainingVideo"
+            );
+
+        cameraStream =
+            await navigator.mediaDevices.getUserMedia({{
+                video: {{
+                    facingMode: {{
+                        ideal: "environment"
+                    }}
+                }},
+                audio: false
+            }});
+
+        video.srcObject =
+            cameraStream;
+
+        video.style.display =
+            "block";
+
+        document.getElementById(
+            "captureButton"
+        ).style.display =
+            "block";
+
+    }} catch (e) {{
+
+        alert(
+            "Camera failed: " +
+            e.message
+        );
+
+    }}
+
+}}
+
+
+// =====================================================
+// CAPTURE CAMERA PHOTO
+// =====================================================
+
+function captureCameraPhoto() {{
+
+    const video =
+        document.getElementById(
+            "trainingVideo"
+        );
+
+    if (
+        !video.videoWidth ||
+        !video.videoHeight
+    ) {{
+
+        alert(
+            "Camera is not ready yet."
+        );
+
+        return;
+    }}
+
+    const temp =
+        document.createElement(
+            "canvas"
+        );
+
+    temp.width =
+        video.videoWidth;
+
+    temp.height =
+        video.videoHeight;
+
+    const tempCtx =
+        temp.getContext("2d");
+
+    tempCtx.drawImage(
+        video,
+        0,
+        0,
+        temp.width,
+        temp.height
+    );
+
+    const dataUrl =
+        temp.toDataURL(
+            "image/jpeg",
+            0.90
+        );
+
+    const img =
+        new Image();
+
+    img.onload = function() {{
+
+        trainingImage =
+            img;
+
+        trainingImageName =
+            "camera_" +
+            Date.now() +
+            ".jpg";
+
+        showTrainingCanvas();
+
+        if (cameraStream) {{
+
+            cameraStream
+                .getTracks()
+                .forEach(
+                    track => track.stop()
+                );
+
+            cameraStream = null;
+
+        }}
+
+        video.style.display =
+            "none";
+
+        document.getElementById(
+            "captureButton"
+        ).style.display =
+            "none";
+
+    }};
+
+    img.src =
+        dataUrl;
+
+}}
+
+
+// =====================================================
+// SAVE TRAINING IMAGE
+// =====================================================
+
+async function saveTrainingImage() {{
+
+    const result =
+        document.getElementById(
+            "saveResult"
+        );
+
+    if (!trainingImage) {{
+
+        result.innerHTML =
+            "<div class='warning'>" +
+            "Choose or capture an image first." +
+            "</div>";
+
+        return;
+    }}
+
+    if (!boxes.length) {{
+
+        result.innerHTML =
+            "<div class='warning'>" +
+            "Draw at least one box first." +
+            "</div>";
+
+        return;
+    }}
+
+    // Create full-resolution image
+    const temp =
+        document.createElement(
+            "canvas"
+        );
+
+    temp.width =
+        trainingImage.naturalWidth ||
+        trainingImage.width;
+
+    temp.height =
+        trainingImage.naturalHeight ||
+        trainingImage.height;
+
+    const tempCtx =
+        temp.getContext("2d");
+
+    tempCtx.drawImage(
+        trainingImage,
+        0,
+        0,
+        temp.width,
+        temp.height
+    );
+
+    const imageData =
+        temp.toDataURL(
+            "image/jpeg",
+            0.90
+        );
+
+    // Convert x1/y1/x2/y2 to YOLO
+    // x_center, y_center, width, height
+    const annotations =
+        boxes.map(
+            function(b) {{
+
+                return {{
+                    class_name:
+                        b.class_name,
+
+                    x_center:
+                        (b.x1 + b.x2) / 2,
+
+                    y_center:
+                        (b.y1 + b.y2) / 2,
+
+                    width:
+                        b.x2 - b.x1,
+
+                    height:
+                        b.y2 - b.y1
+                }};
+
+            }}
+        );
+
+    result.innerHTML =
+        "<div class='info'>" +
+        "Saving..." +
+        "</div>";
+
+    try {{
+
+        const response =
+            await fetch(
+                "/api/training/image",
+                {{
+                    method: "POST",
+
+                    headers: {{
+                        "Content-Type":
+                            "application/json"
+                    }},
+
+                    body:
+                        JSON.stringify({{
+                            filename:
+                                trainingImageName,
+
+                            image_data:
+                                imageData,
+
+                            annotations:
+                                annotations
+                        }})
+                }}
+            );
+
+        const data =
+            await response.json();
+
+        if (!data.ok) {{
+
+            result.innerHTML =
+                "<div class='warning'>" +
+                (
+                    data.error ||
+                    "Save failed."
+                ) +
+                "</div>";
+
+            return;
+        }}
+
+        result.innerHTML =
+            "<div class='success'>" +
+            "✅ Image and annotations saved successfully." +
+            "</div>";
+
+        document.getElementById(
+            "totalImages"
+        ).innerText =
+            data.summary.total_images;
+
+        document.getElementById(
+            "labeledImages"
+        ).innerText =
+            data.summary.labeled_images;
+
+        document.getElementById(
+            "annotationCount"
+        ).innerText =
+            data.summary.annotations;
+
+        // Reset current image
+        trainingImage = null;
+        trainingImageName = "";
+        boxes = [];
+
+        if (canvas) {{
+
+            ctx.clearRect(
+                0,
+                0,
+                canvas.width,
+                canvas.height
+            );
+
+            canvas.style.display =
+                "none";
+
+        }}
+
+        document.getElementById(
+            "saveTrainingButton"
+        ).style.display =
+            "none";
+
+        document.getElementById(
+            "trainingInfo"
+        ).style.display =
+            "none";
+
+        document.getElementById(
+            "boxList"
+        ).innerHTML = "";
+
+        document.getElementById(
+            "imageFile"
+        ).value = "";
+
+    }} catch (e) {{
+
+        result.innerHTML =
+            "<div class='warning'>" +
+            "Save failed: " +
+            e.message +
+            "</div>";
+
+    }}
+
+}}
+
+
+// =====================================================
+// TRAINING STATUS
+// =====================================================
 
 async function refreshTraining() {{
 
     try {{
 
         const r =
-            await fetch("/api/training/summary");
+            await fetch(
+                "/api/training/summary"
+            );
 
-        const d = await r.json();
+        const d =
+            await r.json();
 
         document.getElementById(
             "statusMessage"
-        ).innerText = d.message;
+        ).innerText =
+            d.message;
 
         const bar =
-            document.getElementById("progressBar");
+            document.getElementById(
+                "progressBar"
+            );
 
-        bar.style.width = d.progress + "%";
+        bar.style.width =
+            d.progress + "%";
 
-        bar.innerText = d.progress + "%";
+        bar.innerText =
+            d.progress + "%";
+
+        document.getElementById(
+            "totalImages"
+        ).innerText =
+            d.total_images;
+
+        document.getElementById(
+            "labeledImages"
+        ).innerText =
+            d.labeled_images;
+
+        document.getElementById(
+            "annotationCount"
+        ).innerText =
+            d.annotations;
 
     }} catch (e) {{
 
@@ -836,12 +2071,18 @@ async function refreshTraining() {{
 
 }}
 
-setInterval(refreshTraining, 5000);
+setInterval(
+    refreshTraining,
+    5000
+);
 
 </script>
 """
 
-    return layout("AI Training", content)
+    return layout(
+        "AI Training",
+        content
+    )
 
 
 # =========================================================
@@ -892,12 +2133,14 @@ async function startCamera() {{
 
         document.getElementById(
             "video"
-        ).srcObject = stream;
+        ).srcObject =
+            stream;
 
     }} catch (e) {{
 
         alert(
-            "Camera permission failed: " + e.message
+            "Camera permission failed: " +
+            e.message
         );
 
     }}
@@ -907,7 +2150,10 @@ async function startCamera() {{
 </script>
 """
 
-    return layout("Camera", content)
+    return layout(
+        "Camera",
+        content
+    )
 
 
 # =========================================================
@@ -966,7 +2212,10 @@ def history_page():
 </div>
 """
 
-    return layout("History", content)
+    return layout(
+        "History",
+        content
+    )
 
 
 # =========================================================
@@ -1018,11 +2267,14 @@ AI:
 </div>
 """
 
-    return layout("Settings", content)
+    return layout(
+        "Settings",
+        content
+    )
 
 
 # =========================================================
-# API
+# API STATUS
 # =========================================================
 
 def api_status():
@@ -1061,9 +2313,16 @@ def api_training_summary():
 # HTTP HANDLER
 # =========================================================
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(
+    BaseHTTPRequestHandler
+):
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+
         print(
             "%s - %s"
             % (
@@ -1072,15 +2331,17 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
-    # -----------------------------------------------------
+
+    # =====================================================
     # GET
-    # -----------------------------------------------------
+    # =====================================================
 
     def do_GET(self):
 
         try:
 
-            parsed = urlparse(self.path)
+            parsed =  urlparse(self.path)
+
             path = parsed.path
 
             # -------------------------
@@ -1088,28 +2349,41 @@ class Handler(BaseHTTPRequestHandler):
             # -------------------------
 
             if path == "/":
-                self.send_html(dashboard_page())
+                self.send_html(
+                    dashboard_page()
+                )
                 return
 
             if path == "/camera":
-                self.send_html(camera_page())
+                self.send_html(
+                    camera_page()
+                )
                 return
 
             if path == "/buckets":
-                self.send_html(buckets_page())
+                self.send_html(
+                    buckets_page()
+                )
                 return
 
             if path == "/training":
-                self.send_html(training_page())
+                self.send_html(
+                    training_page()
+                )
                 return
 
             if path == "/history":
-                self.send_html(history_page())
+                self.send_html(
+                    history_page()
+                )
                 return
 
             if path == "/settings":
-                self.send_html(settings_page())
+                self.send_html(
+                    settings_page()
+                )
                 return
+
 
             # -------------------------
             # API
@@ -1124,6 +2398,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
             if path == "/api/training/summary":
 
                 send_json(
@@ -1132,6 +2407,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 return
+
 
             if path == "/api/buckets":
 
@@ -1155,6 +2431,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
             if path == "/api/dataset/summary":
 
                 send_json(
@@ -1166,6 +2443,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 return
+
 
             if path == "/api/model/status":
 
@@ -1179,6 +2457,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
             send_json(
                 self,
                 {
@@ -1187,6 +2466,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 404
             )
+
 
         except BrokenPipeError:
             pass
@@ -1214,31 +2494,40 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # -----------------------------------------------------
+
+    # =====================================================
     # POST
-    # -----------------------------------------------------
+    # =====================================================
 
     def do_POST(self):
 
         try:
 
-            parsed = urlparse(self.path)
+            parsed =  urlparse(self.path)
+
             path = parsed.path
 
-            # -------------------------
+
+            # =================================================
             # ADD BUCKET
-            # -------------------------
+            # =================================================
 
             if path == "/api/buckets":
 
-                data = read_json(self)
+                data =  read_json(self)
 
                 name = str(
-                    data.get("name", "")
+                    data.get(
+                        "name",
+                        ""
+                    )
                 ).strip()
 
                 capacity = float(
-                    data.get("capacity", 0) or 0
+                    data.get(
+                        "capacity",
+                        0
+                    ) or 0
                 )
 
                 if not name:
@@ -1248,7 +2537,7 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "ok": False,
                             "error":
-                            "Bucket name is required"
+                                "Bucket name is required"
                         },
                         400
                     )
@@ -1269,80 +2558,355 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "message":
-                        "Bucket added successfully"
+                            "Bucket added successfully"
                     }
                 )
 
                 return
 
-            # -------------------------
-            # START TRAINING
-            # -------------------------
 
-            if path == "/api/train":
+            # =================================================
+            # SAVE TRAINING IMAGE
+            # =================================================
 
-                summary = dataset_summary()
+            if path == "/api/training/image":
 
-                if summary["labeled_images"] < 5:
+                data = read_json(self)
+
+                filename = str(
+                        data.get(
+                            "filename",
+                            "training_image.jpg"
+                        )
+                    ).strip()
+
+                image_data_url = data.get(
+                        "image_data"
+                    )
+
+                annotations =data.get(
+                        "annotations",
+                        []
+                    )
+
+                if not image_data_url:
 
                     send_json(
                         self,
                         {
                             "ok": False,
                             "error":
-                            "At least 5 labeled images are required."
+                                "Image is required."
                         },
                         400
                     )
 
                     return
 
-                set_training_state(
-                    "WAITING",
-                    0,
-                    "Training is handled outside the Render Web Service."
-                )
+
+                if not isinstance(
+                    annotations,
+                    list
+                ) or len(annotations) == 0:
+
+                    send_json(
+                        self,
+                        {
+                            "ok": False,
+                            "error":
+                                "At least one annotation is required."
+                        },
+                        400
+                    )
+
+                    return
+
+
+                image_bytes =decode_image_data(
+                        image_data_url
+                    )
+
+
+                if len(image_bytes) > 10 * 1024 * 1024:
+
+                    send_json(
+                        self,
+                        {
+                            "ok": False,
+                            "error":
+                                "Image is too large. Maximum 10 MB."
+                        },
+                        400
+                    )
+
+                    return
+
+
+                # Validate annotations
+                clean_annotations = []
+
+
+                for item in annotations:
+
+                    class_name =  str(
+                            item.get(
+                                "class_name",
+                                ""
+                            )
+                        ).strip()
+
+
+                    if class_name not in CLASSES:
+
+                        send_json(
+                            self,
+                            {
+                                "ok": False,
+                                "error":
+                                    "Invalid class: " +
+                                    class_name
+                            },
+                            400
+                        )
+
+                        return
+
+
+                    x_center =  float(
+                            item.get(
+                                "x_center",
+                                0
+                            )
+                        )
+
+                    y_center =  float(
+                            item.get(
+                                "y_center",
+                                0
+                            )
+                        )
+
+                    width =  float(
+                            item.get(
+                                "width",
+                                0
+                            )
+                        )
+
+                    height =   float(
+                            item.get(
+                                "height",
+                                0
+                            )
+                        )
+
+
+                    if not (
+                        0 <= x_center <= 1
+                        and
+                        0 <= y_center <= 1
+                        and
+                        0 < width <= 1
+                        and
+                        0 < height <= 1
+                    ):
+
+                        send_json(
+                            self,
+                            {
+                                "ok": False,
+                                "error":
+                                    "Invalid bounding box."
+                            },
+                            400
+                        )
+
+                        return
+
+
+                    clean_annotations.append(
+                        (
+                            class_name,
+                            x_center,
+                            y_center,
+                            width,
+                            height
+                        )
+                    )
+
+
+                # Save everything in one transaction
+                conn =  db_connect()
+
+                try:
+
+                    cur = conn.cursor()
+
+                    cur.execute("""
+                        INSERT INTO dataset_images
+                        (
+                            filename,
+                            image_data,
+                            labeled
+                        )
+                        VALUES
+                        (
+                            %s,
+                            %s,
+                            TRUE
+                        )
+                        RETURNING id
+                    """, (
+                        filename,
+                        psycopg2.Binary(
+                            image_bytes
+                        )
+                    ))
+
+                    image_id =  cur.fetchone()[0]
+
+
+                    for item in clean_annotations:
+
+                        cur.execute("""
+                            INSERT INTO annotations
+                            (
+                                image_id,
+                                class_name,
+                                x_center,
+                                y_center,
+                                width,
+                                height
+                            )
+                            VALUES
+                            (
+                                %s,
+                                %s,
+                                %s,
+                                %s,
+                                %s,
+                                %s
+                            )
+                        """, (
+                            image_id,
+                            item[0],
+                            item[1],
+                            item[2],
+                            item[3],
+                            item[4]
+                        ))
+
+
+                    conn.commit()
+
+
+                except Exception:
+
+                    conn.rollback()
+
+                    raise
+
+
+                finally:
+
+                    cur.close()
+                    conn.close()
+
+
+                summary = dataset_summary()
+
 
                 send_json(
                     self,
                     {
                         "ok": True,
-                        "status": "WAITING",
+                        "image_id":
+                            image_id,
                         "message":
-                        "Dataset is ready for external YOLO training."
+                            "Training image saved successfully.",
+                        "summary":
+                            summary
                     }
                 )
 
                 return
 
-            # -------------------------
+
+            # =================================================
+            # START TRAINING
+            # =================================================
+
+            if path == "/api/train":
+
+                summary = dataset_summary()
+
+
+                if summary[
+                    "labeled_images"
+                ] < 5:
+
+                    send_json(
+                        self,
+                        {
+                            "ok": False,
+                            "error":
+                                "At least 5 labeled images are required."
+                        },
+                        400
+                    )
+
+                    return
+
+
+                set_training_state(
+                    "WAITING",
+                    0,
+                    "Dataset is ready for external YOLO training."
+                )
+
+
+                send_json(
+                    self,
+                    {
+                        "ok": True,
+                        "status":
+                            "WAITING",
+                        "message":
+                            "Dataset is ready for external YOLO training."
+                    }
+                )
+
+                return
+
+
+            # =================================================
             # SAVE TRAINING STATE
-            # -------------------------
+            # =================================================
 
             if path == "/api/training/state":
 
                 data = read_json(self)
 
                 status = str(
-                    data.get(
-                        "status",
-                        "NOT_STARTED"
+                        data.get(
+                            "status",
+                            "NOT_STARTED"
+                        )
                     )
-                )
 
-                progress = int(
-                    data.get(
-                        "progress",
-                        0
+                progress =  int(
+                        data.get(
+                            "progress",
+                            0
+                        )
                     )
-                )
 
-                message = str(
-                    data.get(
-                        "message",
-                        ""
+                message =  str(
+                        data.get(
+                            "message",
+                            ""
+                        )
                     )
-                )
 
                 set_training_state(
                     status,
@@ -1359,6 +2923,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
             send_json(
                 self,
                 {
@@ -1367,6 +2932,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 404
             )
+
 
         except BrokenPipeError:
             pass
@@ -1394,17 +2960,25 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    # -----------------------------------------------------
+
+    # =====================================================
     # HTML
-    # -----------------------------------------------------
+    # =====================================================
 
-    def send_html(self, html):
+    def send_html(
+        self,
+        html
+    ):
 
-        body = html.encode("utf-8")
+        body =  html.encode(
+                "utf-8"
+            )
 
         try:
 
-            self.send_response(200)
+            self.send_response(
+                200
+            )
 
             self.send_header(
                 "Content-Type",
@@ -1418,7 +2992,9 @@ class Handler(BaseHTTPRequestHandler):
 
             self.end_headers()
 
-            self.wfile.write(body)
+            self.wfile.write(
+                body
+            )
 
         except BrokenPipeError:
             pass
@@ -1433,10 +3009,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
 
-    print("====================================")
-    print(" BUCKET COUNTER AI")
-    print(" Underground production monitoring")
-    print("====================================")
+    print(
+        "===================================="
+    )
+
+    print(
+        " BUCKET COUNTER AI"
+    )
+
+    print(
+        " Underground production monitoring"
+    )
+
+    print(
+        "===================================="
+    )
+
 
     try:
 
@@ -1452,25 +3040,35 @@ def main():
             "DATABASE ERROR:"
         )
 
-        print(str(e))
+        print(
+            str(e)
+        )
 
         raise
 
-    print("YOLO: AVAILABLE FOR MODEL USE")
+
+    print(
+        "YOLO: AVAILABLE FOR MODEL USE"
+    )
+
     print(
         "Model:",
-        "READY" if model_ready()
+        "READY"
+        if model_ready()
         else "NOT READY"
     )
 
+
     server = ThreadingHTTPServer(
-        (HOST, PORT),
-        Handler
-    )
+            (HOST, PORT),
+            Handler
+        )
+
 
     print(
         f"Server running on {HOST}:{PORT}"
     )
+
 
     server.serve_forever()
 
