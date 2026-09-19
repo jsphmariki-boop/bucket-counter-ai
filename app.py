@@ -5,7 +5,6 @@ import json
 import time
 import base64
 import shutil
-import sqlite3
 import threading
 from datetime import datetime, date
 from urllib.parse import urlparse
@@ -19,8 +18,6 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8080"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DB_FILE = os.path.join(BASE_DIR, "bucket_counter.db")
 
 AI_DIR = os.path.join(BASE_DIR, "ai")
 DATASET_DIR = os.path.join(AI_DIR, "dataset")
@@ -40,10 +37,244 @@ for folder in [
 
 
 # =========================================================
+# POSTGRESQL / SUPABASE
+# =========================================================
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    POSTGRES_AVAILABLE = True
+
+except Exception as e:
+
+    POSTGRES_AVAILABLE = False
+    POSTGRES_IMPORT_ERROR = str(e)
+
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+class DBConnection:
+
+    def __init__(self):
+
+        if not POSTGRES_AVAILABLE:
+
+            raise RuntimeError(
+                "psycopg2-binary is not installed. "
+                "Add psycopg2-binary to requirements.txt"
+            )
+
+        if not DATABASE_URL:
+
+            raise RuntimeError(
+                "DATABASE_URL is not configured in Render."
+            )
+
+        self.con = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=20
+        )
+
+    def execute(self, sql, params=None):
+
+        # Convert SQLite-style placeholders to PostgreSQL
+        sql = sql.replace("?", "%s")
+
+        cursor = self.con.cursor(
+            cursor_factory=RealDictCursor
+        )
+
+        cursor.execute(
+            sql,
+            params or ()
+        )
+
+        return cursor
+
+    def executescript(self, sql):
+
+        cursor = self.con.cursor(
+            cursor_factory=RealDictCursor
+        )
+
+        statements = [
+            x.strip()
+            for x in sql.split(";")
+            if x.strip()
+        ]
+
+        for statement in statements:
+
+            cursor.execute(statement)
+
+        return cursor
+
+    def commit(self):
+
+        self.con.commit()
+
+    def rollback(self):
+
+        self.con.rollback()
+
+    def close(self):
+
+        self.con.close()
+
+
+def db():
+
+    return DBConnection()
+
+
+# =========================================================
+# DATABASE INITIALIZATION
+# =========================================================
+
+def init_db():
+
+    con = db()
+
+    con.executescript("""
+
+    CREATE TABLE IF NOT EXISTS buckets(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        name TEXT NOT NULL,
+
+        capacity DOUBLE PRECISION DEFAULT 0,
+
+        active INTEGER DEFAULT 1,
+
+        created_at TEXT NOT NULL
+    );
+
+
+    CREATE TABLE IF NOT EXISTS bucket_images(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        bucket_id BIGINT NOT NULL,
+
+        filename TEXT NOT NULL,
+
+        image_data TEXT NOT NULL,
+
+        created_at TEXT NOT NULL
+    );
+
+
+    CREATE TABLE IF NOT EXISTS dataset_images(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        filename TEXT NOT NULL,
+
+        image_data TEXT NOT NULL,
+
+        width INTEGER DEFAULT 0,
+
+        height INTEGER DEFAULT 0,
+
+        created_at TEXT NOT NULL
+    );
+
+
+    CREATE TABLE IF NOT EXISTS annotations(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        image_id BIGINT NOT NULL,
+
+        class_id INTEGER NOT NULL,
+
+        class_name TEXT NOT NULL,
+
+        x_center DOUBLE PRECISION NOT NULL,
+
+        y_center DOUBLE PRECISION NOT NULL,
+
+        box_width DOUBLE PRECISION NOT NULL,
+
+        box_height DOUBLE PRECISION NOT NULL,
+
+        created_at TEXT NOT NULL
+    );
+
+
+    CREATE TABLE IF NOT EXISTS detections(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        detection_time TEXT NOT NULL,
+
+        bucket_id BIGINT,
+
+        bucket_name TEXT,
+
+        status TEXT NOT NULL,
+
+        counted INTEGER DEFAULT 0,
+
+        confidence DOUBLE PRECISION DEFAULT 0,
+
+        track_id INTEGER,
+
+        note TEXT DEFAULT ''
+    );
+
+
+    CREATE TABLE IF NOT EXISTS daily_counts(
+
+        id BIGSERIAL PRIMARY KEY,
+
+        count_date TEXT UNIQUE NOT NULL,
+
+        loaded INTEGER DEFAULT 0,
+
+        empty INTEGER DEFAULT 0,
+
+        people INTEGER DEFAULT 0,
+
+        equipment INTEGER DEFAULT 0,
+
+        unknown INTEGER DEFAULT 0
+    );
+
+
+    CREATE TABLE IF NOT EXISTS settings(
+
+        key TEXT PRIMARY KEY,
+
+        value TEXT
+    );
+
+
+    INSERT INTO settings
+    (key, value)
+
+    VALUES
+    ('line_position', '55')
+
+    ON CONFLICT (key)
+    DO NOTHING;
+
+    """)
+
+    con.commit()
+    con.close()
+
+
+# =========================================================
 # OPTIONAL AI IMPORTS
 # =========================================================
 
 try:
+
     from ultralytics import YOLO
 
     YOLO_AVAILABLE = True
@@ -56,6 +287,7 @@ except Exception as e:
 
 
 try:
+
     import cv2
     import numpy as np
 
@@ -87,10 +319,16 @@ CLASS_NAMES = [
 # =========================================================
 
 TRAIN_STATUS = {
+
     "running": False,
-    "message": "Not started",
+
+    "message":
+        "Not started",
+
     "progress": 0,
+
     "error": "",
+
     "finished": False
 }
 
@@ -102,6 +340,7 @@ TRAIN_LOCK = threading.Lock()
 # =========================================================
 
 MODEL = None
+
 MODEL_LOCK = threading.Lock()
 
 
@@ -117,154 +356,6 @@ LAST_TRACK_TIME = {}
 
 
 # =========================================================
-# DATABASE
-# =========================================================
-
-def db():
-
-    con = sqlite3.connect(
-        DB_FILE,
-        timeout=20
-    )
-
-    con.row_factory = sqlite3.Row
-
-    return con
-
-
-def init_db():
-
-    con = db()
-
-    con.executescript("""
-
-    CREATE TABLE IF NOT EXISTS buckets(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        name TEXT NOT NULL,
-
-        capacity REAL DEFAULT 0,
-
-        active INTEGER DEFAULT 1,
-
-        created_at TEXT NOT NULL
-    );
-
-
-    CREATE TABLE IF NOT EXISTS bucket_images(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        bucket_id INTEGER NOT NULL,
-
-        filename TEXT NOT NULL,
-
-        image_data TEXT NOT NULL,
-
-        created_at TEXT NOT NULL
-    );
-
-
-    CREATE TABLE IF NOT EXISTS dataset_images(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        filename TEXT NOT NULL,
-
-        image_data TEXT NOT NULL,
-
-        width INTEGER DEFAULT 0,
-
-        height INTEGER DEFAULT 0,
-
-        created_at TEXT NOT NULL
-    );
-
-
-    CREATE TABLE IF NOT EXISTS annotations(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        image_id INTEGER NOT NULL,
-
-        class_id INTEGER NOT NULL,
-
-        class_name TEXT NOT NULL,
-
-        x_center REAL NOT NULL,
-
-        y_center REAL NOT NULL,
-
-        box_width REAL NOT NULL,
-
-        box_height REAL NOT NULL,
-
-        created_at TEXT NOT NULL
-    );
-
-
-    CREATE TABLE IF NOT EXISTS detections(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        detection_time TEXT NOT NULL,
-
-        bucket_id INTEGER,
-
-        bucket_name TEXT,
-
-        status TEXT NOT NULL,
-
-        counted INTEGER DEFAULT 0,
-
-        confidence REAL DEFAULT 0,
-
-        track_id INTEGER,
-
-        note TEXT DEFAULT ''
-    );
-
-
-    CREATE TABLE IF NOT EXISTS daily_counts(
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        count_date TEXT UNIQUE NOT NULL,
-
-        loaded INTEGER DEFAULT 0,
-
-        empty INTEGER DEFAULT 0,
-
-        people INTEGER DEFAULT 0,
-
-        equipment INTEGER DEFAULT 0,
-
-        unknown INTEGER DEFAULT 0
-    );
-
-
-    CREATE TABLE IF NOT EXISTS settings(
-
-        key TEXT PRIMARY KEY,
-
-        value TEXT
-    );
-
-
-    INSERT OR IGNORE INTO settings
-    (key,value)
-    VALUES
-    ('line_position','55');
-
-    """)
-
-    con.commit()
-
-    con.close()
-
-
-# =========================================================
 # SETTINGS
 # =========================================================
 
@@ -273,13 +364,18 @@ def setting(key, default=None):
     con = db()
 
     row = con.execute(
-        "SELECT value FROM settings WHERE key=?",
+        """
+        SELECT value
+        FROM settings
+        WHERE key=?
+        """,
         (key,)
     ).fetchone()
 
     con.close()
 
     if row:
+
         return row["value"]
 
     return default
@@ -291,15 +387,22 @@ def set_setting(key, value):
 
     con.execute(
         """
-        INSERT OR REPLACE INTO settings
-        (key,value)
-        VALUES (?,?)
+        INSERT INTO settings
+        (key, value)
+
+        VALUES (?, ?)
+
+        ON CONFLICT (key)
+        DO UPDATE SET
+        value = EXCLUDED.value
         """,
-        (key, str(value))
+        (
+            key,
+            str(value)
+        )
     )
 
     con.commit()
-
     con.close()
 
 
@@ -320,22 +423,40 @@ def now():
 
 def data_url_to_bytes(data_url):
 
-    if not isinstance(data_url, str):
-        raise ValueError("Invalid image data")
+    if not isinstance(
+        data_url,
+        str
+    ):
+
+        raise ValueError(
+            "Invalid image data"
+        )
 
     if "," not in data_url:
-        raise ValueError("Invalid image data")
 
-    head, payload = data_url.split(",", 1)
+        raise ValueError(
+            "Invalid image data"
+        )
 
-    return base64.b64decode(payload)
+    head, payload = data_url.split(
+        ",",
+        1
+    )
+
+    return base64.b64decode(
+        payload
+    )
 
 
 # =========================================================
 # JSON RESPONSE
 # =========================================================
 
-def json_response(handler, obj, code=200):
+def json_response(
+    handler,
+    obj,
+    code=200
+):
 
     raw = json.dumps(
         obj,
@@ -368,7 +489,11 @@ def json_response(handler, obj, code=200):
 # HTML RESPONSE
 # =========================================================
 
-def html_response(handler, html, code=200):
+def html_response(
+    handler,
+    html,
+    code=200
+):
 
     raw = html.encode("utf-8")
 
@@ -405,6 +530,7 @@ def read_json(handler):
     raw = handler.rfile.read(length)
 
     if not raw:
+
         return {}
 
     return json.loads(
@@ -424,8 +550,11 @@ def active_bucket():
         """
         SELECT *
         FROM buckets
+
         WHERE active=1
+
         ORDER BY id DESC
+
         LIMIT 1
         """
     ).fetchone()
@@ -433,6 +562,7 @@ def active_bucket():
     con.close()
 
     if row:
+
         return dict(row)
 
     return None
@@ -450,18 +580,31 @@ def update_daily(status):
 
     con.execute(
         """
-        INSERT OR IGNORE INTO
-        daily_counts(count_date)
+        INSERT INTO daily_counts
+        (count_date)
+
         VALUES(?)
+
+        ON CONFLICT (count_date)
+        DO NOTHING
         """,
         (d,)
     )
 
     column = {
-        "BUCKET_LOADED": "loaded",
-        "BUCKET_EMPTY": "empty",
-        "PEOPLE": "people",
-        "EQUIPMENT": "equipment"
+
+        "BUCKET_LOADED":
+            "loaded",
+
+        "BUCKET_EMPTY":
+            "empty",
+
+        "PEOPLE":
+            "people",
+
+        "EQUIPMENT":
+            "equipment"
+
     }.get(
         status,
         "unknown"
@@ -471,7 +614,7 @@ def update_daily(status):
         f"""
         UPDATE daily_counts
 
-        SET {column}={column}+1
+        SET {column} = {column} + 1
 
         WHERE count_date=?
         """,
@@ -517,6 +660,7 @@ def save_detection(
         (?,?,?,?,?,?,?,?)
         """,
         (
+
             now(),
 
             bucket["id"]
@@ -536,6 +680,7 @@ def save_detection(
             track_id,
 
             note
+
         )
     )
 
@@ -572,9 +717,13 @@ def get_model():
     global MODEL
 
     if not YOLO_AVAILABLE:
+
         return None
 
-    if not os.path.exists(MODEL_FILE):
+    if not os.path.exists(
+        MODEL_FILE
+    ):
+
         return None
 
     with MODEL_LOCK:
@@ -612,7 +761,9 @@ def prepare_dataset():
             """
             SELECT *
             FROM annotations
+
             WHERE image_id=?
+
             ORDER BY id
             """,
             (row["id"],)
@@ -621,7 +772,10 @@ def prepare_dataset():
         if annotations:
 
             labeled.append(
-                (row, annotations)
+                (
+                    row,
+                    annotations
+                )
             )
 
     con.close()
@@ -633,7 +787,9 @@ def prepare_dataset():
             f"Current: {len(labeled)}"
         )
 
-    if os.path.exists(DATASET_DIR):
+    if os.path.exists(
+        DATASET_DIR
+    ):
 
         shutil.rmtree(
             DATASET_DIR
@@ -677,21 +833,29 @@ def prepare_dataset():
 
     split_at = max(
         1,
-        int(len(labeled) * 0.8)
+        int(
+            len(labeled) * 0.8
+        )
     )
 
     if split_at >= len(labeled):
 
         split_at = len(labeled) - 1
 
-    for index, item in enumerate(labeled):
+    for index, item in enumerate(
+        labeled
+    ):
 
         row, annotations = item
 
         split = (
+
             "train"
+
             if index < split_at
+
             else "val"
+
         )
 
         filename = (
@@ -742,11 +906,16 @@ def prepare_dataset():
                 )
 
     yaml_text = (
+
         f"path: "
         f"{DATASET_DIR.replace(chr(92), '/')}\n"
+
         f"train: images/train\n"
+
         f"val: images/val\n"
+
         f"names:\n"
+
     )
 
     for i, name in enumerate(
@@ -763,7 +932,9 @@ def prepare_dataset():
         encoding="utf-8"
     ) as f:
 
-        f.write(yaml_text)
+        f.write(
+            yaml_text
+        )
 
     return len(labeled)
 
@@ -779,11 +950,18 @@ def train_worker():
     with TRAIN_LOCK:
 
         TRAIN_STATUS.update(
+
             running=True,
-            message="Preparing dataset...",
+
+            message=
+                "Preparing dataset...",
+
             progress=5,
+
             error="",
+
             finished=False
+
         )
 
     try:
@@ -791,8 +969,11 @@ def train_worker():
         if not YOLO_AVAILABLE:
 
             raise RuntimeError(
+
                 "Ultralytics is not installed. "
-                "Deploy with requirements.txt on Render first."
+                "Deploy with requirements.txt "
+                "on Render first."
+
             )
 
         number = prepare_dataset()
@@ -800,11 +981,13 @@ def train_worker():
         with TRAIN_LOCK:
 
             TRAIN_STATUS.update(
-                message=(
+
+                message=
                     f"Dataset ready: "
-                    f"{number} labeled images"
-                ),
+                    f"{number} labeled images",
+
                 progress=15
+
             )
 
         base_model = YOLO(
@@ -814,19 +997,32 @@ def train_worker():
         with TRAIN_LOCK:
 
             TRAIN_STATUS.update(
-                message="Training YOLO...",
+
+                message=
+                    "Training YOLO...",
+
                 progress=20
+
             )
 
         base_model.train(
+
             data=DATA_YAML,
+
             epochs=20,
+
             imgsz=640,
+
             batch=4,
+
             project=TRAIN_DIR,
+
             name="bucket_ai",
+
             exist_ok=True,
+
             verbose=False
+
         )
 
         candidates = []
@@ -847,13 +1043,18 @@ def train_worker():
         if not candidates:
 
             raise RuntimeError(
-                "Training finished but best.pt "
-                "was not found"
+
+                "Training finished but "
+                "best.pt was not found"
+
             )
 
         source = max(
+
             candidates,
+
             key=os.path.getmtime
+
         )
 
         shutil.copy2(
@@ -870,13 +1071,17 @@ def train_worker():
         with TRAIN_LOCK:
 
             TRAIN_STATUS.update(
+
                 running=False,
-                message=(
+
+                message=
                     "Training complete. "
-                    "Model is ready."
-                ),
+                    "Model is ready.",
+
                 progress=100,
+
                 finished=True
+
             )
 
     except Exception as e:
@@ -884,11 +1089,18 @@ def train_worker():
         with TRAIN_LOCK:
 
             TRAIN_STATUS.update(
+
                 running=False,
-                message="Training failed",
+
+                message=
+                    "Training failed",
+
                 progress=0,
+
                 error=str(e),
+
                 finished=False
+
             )
 
 
@@ -898,7 +1110,9 @@ def train_worker():
 
 def normalize_name(name):
 
-    text = str(name).upper()
+    text = str(
+        name
+    ).upper()
 
     text = text.replace(
         "-",
@@ -932,6 +1146,7 @@ def normalize_name(name):
 
         "MACHINE":
             "EQUIPMENT"
+
     }
 
     return aliases.get(
@@ -967,6 +1182,7 @@ def process_frame(data_url):
                 "Train a model first.",
 
             "detections": []
+
         }
 
     raw = data_url_to_bytes(
@@ -1003,11 +1219,17 @@ def process_frame(data_url):
     )
 
     results = model.track(
+
         source=frame,
+
         persist=True,
+
         conf=0.35,
+
         iou=0.5,
+
         verbose=False
+
     )
 
     output = []
@@ -1021,6 +1243,7 @@ def process_frame(data_url):
         )
 
         if boxes is None:
+
             continue
 
         if getattr(
@@ -1030,59 +1253,91 @@ def process_frame(data_url):
         ) is not None:
 
             ids = (
+
                 boxes.id
                 .int()
                 .cpu()
                 .tolist()
+
             )
 
         else:
 
             ids = [
+
                 None
+
                 for _ in boxes
+
             ]
 
         coordinates = (
+
             boxes.xyxy
             .cpu()
             .tolist()
+
         )
 
         confidences = (
+
             boxes.conf
             .cpu()
             .tolist()
+
         )
 
         classes = (
+
             boxes.cls
             .int()
             .cpu()
             .tolist()
+
         )
 
         names = (
+
             result.names
-            if hasattr(result, "names")
+
+            if hasattr(
+                result,
+                "names"
+            )
+
             else {}
+
         )
 
         for box, confidence, class_id, track_id in zip(
+
             coordinates,
+
             confidences,
+
             classes,
+
             ids
+
         ):
 
             class_name = normalize_name(
+
                 names.get(
+
                     int(class_id),
-                    CLASS_NAMES[int(class_id)]
+
+                    CLASS_NAMES[
+                        int(class_id)
+                    ]
+
                     if int(class_id)
                     < len(CLASS_NAMES)
+
                     else "UNKNOWN"
+
                 )
+
             )
 
             x1, y1, x2, y2 = map(
@@ -1098,28 +1353,50 @@ def process_frame(data_url):
 
             if track_id is not None:
 
-                previous_y = LAST_TRACK_Y.get(
-                    track_id
+                previous_y = (
+                    LAST_TRACK_Y.get(
+                        track_id
+                    )
                 )
 
                 current_time = time.time()
 
-                previous_time = LAST_TRACK_TIME.get(
-                    track_id,
-                    0
+                previous_time = (
+                    LAST_TRACK_TIME.get(
+                        track_id,
+                        0
+                    )
                 )
 
                 if (
+
                     previous_y is not None
+
                     and
-                    (previous_y - line_y)
+
+                    (
+                        previous_y -
+                        line_y
+                    )
                     *
-                    (center_y - line_y)
+                    (
+                        center_y -
+                        line_y
+                    )
                     <= 0
+
                     and
-                    abs(center_y - previous_y) > 3
+
+                    abs(
+                        center_y -
+                        previous_y
+                    ) > 3
+
                     and
-                    current_time - previous_time > 0.2
+
+                    current_time -
+                    previous_time > 0.2
+
                 ):
 
                     crossed = True
@@ -1135,11 +1412,18 @@ def process_frame(data_url):
             counted = False
 
             if (
+
                 crossed
+
                 and
+
                 track_id is not None
+
                 and
-                track_id not in COUNTED_TRACKS
+
+                track_id not in
+                COUNTED_TRACKS
+
             ):
 
                 COUNTED_TRACKS.add(
@@ -1151,21 +1435,33 @@ def process_frame(data_url):
                     counted = True
 
                     save_detection(
+
                         class_name,
+
                         confidence,
+
                         track_id,
+
                         True,
+
                         "Loaded bucket crossed counting line"
+
                     )
 
                 else:
 
                     save_detection(
+
                         class_name,
+
                         confidence,
+
                         track_id,
+
                         False,
+
                         "Crossed line but not counted"
+
                     )
 
             output.append({
@@ -1196,6 +1492,7 @@ def process_frame(data_url):
 
                 "counted":
                     counted
+
             })
 
     return {
@@ -1211,6 +1508,7 @@ def process_frame(data_url):
         "height": height,
 
         "detections": output
+
     }
 
 
@@ -1227,6 +1525,12 @@ def status_obj():
         )
 
     return {
+
+        "database":
+            "Supabase PostgreSQL",
+
+        "postgres_installed":
+            POSTGRES_AVAILABLE,
 
         "yolo_installed":
             YOLO_AVAILABLE,
@@ -1249,6 +1553,7 @@ def status_obj():
                     "55"
                 )
             )
+
     }
 
 
@@ -1266,30 +1571,37 @@ def dashboard_data():
     con = db()
 
     today = con.execute(
+
         """
         SELECT *
         FROM daily_counts
         WHERE count_date=?
         """,
+
         (today_date,)
+
     ).fetchone()
 
     recent = con.execute(
+
         """
         SELECT *
         FROM daily_counts
         ORDER BY count_date DESC
         LIMIT 7
         """
+
     ).fetchall()
 
     detections = con.execute(
+
         """
         SELECT *
         FROM detections
         ORDER BY id DESC
         LIMIT 30
         """
+
     ).fetchall()
 
     con.close()
@@ -1305,10 +1617,15 @@ def dashboard_data():
         today_data = {
 
             "loaded": 0,
+
             "empty": 0,
+
             "people": 0,
+
             "equipment": 0,
+
             "unknown": 0
+
         }
 
     return {
@@ -1327,6 +1644,7 @@ def dashboard_data():
                 dict(row)
                 for row in detections
             ]
+
     }
 
 
@@ -1560,6 +1878,7 @@ label{
     .stat{
         font-size:23px
     }
+
 }
 
 """
@@ -1740,107 +2059,127 @@ Recent detections
 
 async function load(){
 
-    let s =
-        await (
-            await fetch('/api/status')
-        ).json();
+    try{
 
-    document.getElementById(
-        'status'
-    ).innerHTML =
-        `YOLO:
-        <b class="${
-            s.yolo_installed
-            ? 'ok'
-            : 'bad'
-        }">
-        ${
-            s.yolo_installed
-            ? 'INSTALLED'
-            : 'NOT INSTALLED'
-        }
-        </b>
+        let s =
+            await (
+                await fetch('/api/status')
+            ).json();
 
-        &nbsp;
+        document.getElementById(
+            'status'
+        ).innerHTML =
 
-        Model:
-        <b class="${
-            s.model_ready
-            ? 'ok'
-            : 'bad'
-        }">
-
-        ${
-            s.model_ready
-            ? 'READY'
-            : 'NOT READY'
-        }
-
-        </b>`;
-
-
-    let d =
-        await (
-            await fetch('/api/dashboard')
-        ).json();
-
-
-    [
-        'loaded',
-        'empty',
-        'people',
-        'equipment'
-    ].forEach(
-
-        k => {
-
-            document.getElementById(
-                k
-            ).textContent =
-                d.today[k] || 0;
-
-        }
-
-    );
-
-
-    document.getElementById(
-        'det'
-    ).innerHTML =
-
-        d.detections.map(
-
-            x => `
-
-            <div class="hint">
-
-            ${x.detection_time}
-
-            —
-
-            <b>
-            ${x.status}
+            `Database:
+            <b class="ok">
+            ${s.database}
             </b>
 
-            —
+            &nbsp; | &nbsp;
 
-            ${(x.confidence * 100).toFixed(1)}%
+            YOLO:
+            <b class="${
+                s.yolo_installed
+                ? 'ok'
+                : 'bad'
+            }">
 
             ${
-                x.counted
-                ? '✅ COUNTED'
-                : ''
+                s.yolo_installed
+                ? 'INSTALLED'
+                : 'NOT INSTALLED'
             }
 
-            </div>
+            </b>
 
-            `
+            &nbsp; | &nbsp;
 
-        ).join('')
+            Model:
+            <b class="${
+                s.model_ready
+                ? 'ok'
+                : 'bad'
+            }">
 
-        ||
+            ${
+                s.model_ready
+                ? 'READY'
+                : 'NOT READY'
+            }
 
-        'No detections yet';
+            </b>`;
+
+        let d =
+            await (
+                await fetch('/api/dashboard')
+            ).json();
+
+        [
+            'loaded',
+            'empty',
+            'people',
+            'equipment'
+        ].forEach(
+
+            k => {
+
+                document.getElementById(
+                    k
+                ).textContent =
+                    d.today[k] || 0;
+
+            }
+
+        );
+
+        document.getElementById(
+            'det'
+        ).innerHTML =
+
+            d.detections.map(
+
+                x => `
+
+                <div class="hint">
+
+                ${x.detection_time}
+
+                —
+
+                <b>
+                ${x.status}
+                </b>
+
+                —
+
+                ${(x.confidence * 100).toFixed(1)}%
+
+                ${
+                    x.counted
+                    ? '✅ COUNTED'
+                    : ''
+                }
+
+                </div>
+
+                `
+
+            ).join('')
+
+            ||
+
+            'No detections yet';
+
+    }catch(e){
+
+        document.getElementById(
+            'status'
+        ).innerHTML =
+            '<span class="bad">Database error: '
+            + e.message
+            + '</span>';
+
+    }
 
 }
 
@@ -2001,26 +2340,21 @@ async function start(){
 
             });
 
-
         video.srcObject =
             stream;
-
 
         document.getElementById(
             'msg'
         ).textContent =
             'Camera running';
 
-
         clearInterval(timer);
-
 
         timer =
             setInterval(
                 sendFrame,
                 1200
             );
-
 
     }catch(e){
 
@@ -2042,7 +2376,6 @@ function stop(){
     );
 
     timer = null;
-
 
     if(stream){
 
@@ -2087,22 +2420,18 @@ async function sendFrame(){
 
     }
 
-
     busy = true;
-
 
     let canvas =
         document.createElement(
             'canvas'
         );
 
-
     canvas.width =
         video.videoWidth;
 
     canvas.height =
         video.videoHeight;
-
 
     canvas
     .getContext('2d')
@@ -2111,7 +2440,6 @@ async function sendFrame(){
         0,
         0
     );
-
 
     try{
 
@@ -2141,10 +2469,8 @@ async function sendFrame(){
                 }
             );
 
-
         let data =
             await response.json();
-
 
         if(data.line_y){
 
@@ -2162,7 +2488,6 @@ async function sendFrame(){
                 + '%';
 
         }
-
 
         if(data.detections){
 
@@ -2198,9 +2523,7 @@ async function sendFrame(){
 
                 'Nothing detected';
 
-
             let html = '';
-
 
             data.detections.forEach(
 
@@ -2231,14 +2554,12 @@ async function sendFrame(){
 
             );
 
-
             document.getElementById(
                 'boxes'
             ).innerHTML =
                 html;
 
         }
-
 
     }catch(e){
 
@@ -2249,7 +2570,6 @@ async function sendFrame(){
             + e.message;
 
     }
-
 
     busy = false;
 
@@ -2365,7 +2685,6 @@ async function load(){
             )
         ).json();
 
-
     document.getElementById(
         'buckets'
     ).innerHTML =
@@ -2395,7 +2714,6 @@ async function load(){
 
             <br>
 
-
             <button
             class="btn alt"
             onclick="activate(${x.id})">
@@ -2417,7 +2735,6 @@ async function load(){
         ||
 
         'No buckets yet';
-
 
     document.getElementById(
         'bucketSelect'
@@ -2475,16 +2792,13 @@ async function addBucket(){
             }
         );
 
-
     let data =
         await response.json();
-
 
     alert(
         data.message ||
         data.error
     );
-
 
     load();
 
@@ -2512,7 +2826,6 @@ async function activate(id){
         }
     );
 
-
     load();
 
 }
@@ -2526,7 +2839,6 @@ async function uploadPhotos(){
             'bucketSelect'
         ).value;
 
-
     let files =
         [
             ...
@@ -2535,7 +2847,6 @@ async function uploadPhotos(){
                 'photos'
             ).files
         ];
-
 
     if(
         !bucketId ||
@@ -2548,9 +2859,7 @@ async function uploadPhotos(){
 
     }
 
-
     let success = 0;
-
 
     for(
         let file of files
@@ -2578,7 +2887,6 @@ async function uploadPhotos(){
 
                 }
             );
-
 
         let response =
             await fetch(
@@ -2609,13 +2917,13 @@ async function uploadPhotos(){
                 }
             );
 
-
         if(response.ok){
+
             success++;
+
         }
 
     }
-
 
     document.getElementById(
         'uploadMsg'
@@ -2846,15 +3154,14 @@ document
     selectedFile =
         e.target.files[0];
 
-
     if(!selectedFile){
-        return;
-    }
 
+        return;
+
+    }
 
     let reader =
         new FileReader();
-
 
     reader.onload =
         function(){
@@ -2869,7 +3176,6 @@ document
 
         };
 
-
     reader.readAsDataURL(
         selectedFile
     );
@@ -2882,16 +3188,13 @@ function position(event){
     let rect =
         image.getBoundingClientRect();
 
-
     let x =
         event.clientX -
         rect.left;
 
-
     let y =
         event.clientY -
         rect.top;
-
 
     x =
         Math.max(
@@ -2902,7 +3205,6 @@ function position(event){
             )
         );
 
-
     y =
         Math.max(
             0,
@@ -2911,7 +3213,6 @@ function position(event){
                 y
             )
         );
-
 
     return {
         x:x,
@@ -2926,25 +3227,23 @@ stage.addEventListener(
     function(event){
 
         if(!image.src){
-            return;
-        }
 
+            return;
+
+        }
 
         stage.setPointerCapture(
             event.pointerId
         );
 
-
         let p =
             position(event);
-
 
         drawing = true;
 
         startX = p.x;
 
         startY = p.y;
-
 
         draw.style.left =
             startX + 'px';
@@ -2970,13 +3269,13 @@ stage.addEventListener(
     function(event){
 
         if(!drawing){
-            return;
-        }
 
+            return;
+
+        }
 
         let p =
             position(event);
-
 
         let x =
             Math.min(
@@ -2984,25 +3283,23 @@ stage.addEventListener(
                 p.x
             );
 
-
         let y =
             Math.min(
                 startY,
                 p.y
             );
 
-
         let width =
             Math.abs(
-                p.x - startX
+                p.x -
+                startX
             );
-
 
         let height =
             Math.abs(
-                p.y - startY
+                p.y -
+                startY
             );
-
 
         draw.style.left =
             x + 'px';
@@ -3016,12 +3313,16 @@ stage.addEventListener(
         draw.style.height =
             height + 'px';
 
-
         box = {
+
             x:x,
+
             y:y,
+
             w:width,
+
             h:height
+
         };
 
     }
@@ -3045,12 +3346,10 @@ async function saveTrainingImage(){
             'saveTrainingBtn'
         );
 
-
     const message =
         document.getElementById(
             'saveMsg'
         );
-
 
     try{
 
@@ -3061,7 +3360,6 @@ async function saveTrainingImage(){
             );
 
         }
-
 
         if(
             !box ||
@@ -3075,7 +3373,6 @@ async function saveTrainingImage(){
 
         }
 
-
         if(
             !image.naturalWidth ||
             !image.naturalHeight
@@ -3087,40 +3384,32 @@ async function saveTrainingImage(){
 
         }
 
-
         let rect =
             image.getBoundingClientRect();
-
 
         let scaleX =
             image.naturalWidth /
             rect.width;
 
-
         let scaleY =
             image.naturalHeight /
             rect.height;
-
 
         let x =
             box.x *
             scaleX;
 
-
         let y =
             box.y *
             scaleY;
-
 
         let width =
             box.w *
             scaleX;
 
-
         let height =
             box.h *
             scaleY;
-
 
         let xCenter =
             (
@@ -3130,7 +3419,6 @@ async function saveTrainingImage(){
             /
             image.naturalWidth;
 
-
         let yCenter =
             (
                 y +
@@ -3139,16 +3427,13 @@ async function saveTrainingImage(){
             /
             image.naturalHeight;
 
-
         let boxWidth =
             width /
             image.naturalWidth;
 
-
         let boxHeight =
             height /
             image.naturalHeight;
-
 
         xCenter =
             Math.max(
@@ -3159,7 +3444,6 @@ async function saveTrainingImage(){
                 )
             );
 
-
         yCenter =
             Math.max(
                 0,
@@ -3168,7 +3452,6 @@ async function saveTrainingImage(){
                     yCenter
                 )
             );
-
 
         boxWidth =
             Math.max(
@@ -3179,7 +3462,6 @@ async function saveTrainingImage(){
                 )
             );
 
-
         boxHeight =
             Math.max(
                 0.001,
@@ -3189,12 +3471,10 @@ async function saveTrainingImage(){
                 )
             );
 
-
         button.disabled = true;
 
         button.textContent =
             '⏳ SAVING...';
-
 
         let imageData =
             await new Promise(
@@ -3206,7 +3486,6 @@ async function saveTrainingImage(){
                     let reader =
                         new FileReader();
 
-
                     reader.onload =
                         function(){
 
@@ -3215,7 +3494,6 @@ async function saveTrainingImage(){
                             );
 
                         };
-
 
                     reader.onerror =
                         function(){
@@ -3228,14 +3506,12 @@ async function saveTrainingImage(){
 
                         };
 
-
                     reader.readAsDataURL(
                         selectedFile
                     );
 
                 }
             );
-
 
         let response =
             await fetch(
@@ -3289,13 +3565,10 @@ async function saveTrainingImage(){
                 }
             );
 
-
         let raw =
             await response.text();
 
-
         let data;
-
 
         try{
 
@@ -3315,7 +3588,6 @@ async function saveTrainingImage(){
 
         }
 
-
         if(
             !response.ok ||
             !data.ok
@@ -3331,7 +3603,6 @@ async function saveTrainingImage(){
 
         }
 
-
         message.innerHTML =
 
             '<span class="ok">' +
@@ -3346,30 +3617,24 @@ async function saveTrainingImage(){
 
             '</span>';
 
-
         box = null;
 
         draw.style.display =
             'none';
 
-
         document.getElementById(
             'file'
         ).value = '';
 
-
         selectedFile = null;
 
-
         loadSummary();
-
 
     }catch(error){
 
         console.error(
             error
         );
-
 
         message.innerHTML =
 
@@ -3405,12 +3670,19 @@ async function loadStatus(){
             )
         ).json();
 
-
     document.getElementById(
         'status'
     ).innerHTML =
 
-        `YOLO:
+        `Database:
+
+        <b class="ok">
+        ${s.database}
+        </b>
+
+        |
+
+        YOLO:
 
         <b class="${
             s.yolo_installed
@@ -3442,10 +3714,7 @@ async function loadStatus(){
             : 'NOT READY'
         }
 
-        </b>
-
-        `;
-
+        </b>`;
 
     document.getElementById(
         'trainMsg'
@@ -3487,7 +3756,6 @@ async function loadSummary(){
             )
         ).json();
 
-
     document.getElementById(
         'summary'
     ).innerHTML =
@@ -3528,14 +3796,11 @@ async function train(){
             'trainBtn'
         );
 
-
     button.disabled =
         true;
 
-
     button.textContent =
         '⏳ TRAINING...';
-
 
     await fetch(
         '/api/train',
@@ -3543,7 +3808,6 @@ async function train(){
             method:'POST'
         }
     );
-
 
     poll();
 
@@ -3558,7 +3822,6 @@ async function poll(){
                 '/api/status'
             )
         ).json();
-
 
     document.getElementById(
         'trainMsg'
@@ -3588,7 +3851,6 @@ async function poll(){
 
         '%)';
 
-
     if(
         s.train.running
     ){
@@ -3605,14 +3867,11 @@ async function poll(){
                 'trainBtn'
             );
 
-
         button.disabled =
             false;
 
-
         button.textContent =
             '🚀 TRAIN AI';
-
 
         loadStatus();
 
@@ -3680,7 +3939,6 @@ async function load(){
                 '/api/dashboard'
             )
         ).json();
-
 
     document.getElementById(
         'table'
@@ -3830,7 +4088,6 @@ async function load(){
             )
         ).json();
 
-
     document.getElementById(
         'line'
     ).value =
@@ -3845,7 +4102,6 @@ async function save(){
         document.getElementById(
             'line'
         ).value;
-
 
     let response =
         await fetch(
@@ -3870,10 +4126,8 @@ async function save(){
             }
         );
 
-
     let data =
         await response.json();
-
 
     document.getElementById(
         'msg'
@@ -3929,9 +4183,9 @@ class Handler(
 
         try:
 
-            path =urlparse(
-                    self.path
-                ).path
+            path = urlparse(
+                self.path
+            ).path
 
 
             if path in [
@@ -4005,16 +4259,15 @@ class Handler(
 
                 con = db()
 
-                rows =con.execute(
-                        """
-                        SELECT *
-                        FROM buckets
-                        ORDER BY id DESC
-                        """
-                    ).fetchall()
+                rows = con.execute(
+                    """
+                    SELECT *
+                    FROM buckets
+                    ORDER BY id DESC
+                    """
+                ).fetchall()
 
                 con.close()
-
 
                 return json_response(
 
@@ -4032,34 +4285,29 @@ class Handler(
 
                 con = db()
 
-
-                images =con.execute(
-                        """
-                        SELECT COUNT(*) c
-                        FROM dataset_images
-                        """
-                    ).fetchone()["c"]
-
+                images = con.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM dataset_images
+                    """
+                ).fetchone()["c"]
 
                 labeled = con.execute(
-                        """
-                        SELECT
-                        COUNT(DISTINCT image_id) c
-                        FROM annotations
-                        """
-                    ).fetchone()["c"]
-
+                    """
+                    SELECT
+                    COUNT(DISTINCT image_id) AS c
+                    FROM annotations
+                    """
+                ).fetchone()["c"]
 
                 annotations = con.execute(
-                        """
-                        SELECT COUNT(*) c
-                        FROM annotations
-                        """
-                    ).fetchone()["c"]
-
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM annotations
+                    """
+                ).fetchone()["c"]
 
                 con.close()
-
 
                 return json_response(
 
@@ -4083,82 +4331,88 @@ class Handler(
 
                 con = db()
 
+                rows = con.execute(
+                    """
+                    SELECT
 
-                rows =con.execute(
-                        """
-                        SELECT
-                        detection_time,
-                        bucket_name,
-                        status,
-                        counted,
-                        confidence,
-                        track_id,
-                        note
+                    detection_time,
 
-                        FROM detections
+                    bucket_name,
 
-                        ORDER BY id DESC
-                        """
-                    ).fetchall()
+                    status,
 
+                    counted,
+
+                    confidence,
+
+                    track_id,
+
+                    note
+
+                    FROM detections
+
+                    ORDER BY id DESC
+                    """
+                ).fetchall()
 
                 con.close()
 
-
                 output = io.StringIO()
 
-
                 writer = csv.writer(
-                        output
-                    )
-
+                    output
+                )
 
                 writer.writerow([
-                    "time",
-                    "bucket",
-                    "status",
-                    "counted",
-                    "confidence",
-                    "track_id",
-                    "note"
-                ])
 
+                    "time",
+
+                    "bucket",
+
+                    "status",
+
+                    "counted",
+
+                    "confidence",
+
+                    "track_id",
+
+                    "note"
+
+                ])
 
                 for row in rows:
 
                     writer.writerow(
-                        list(row)
+                        list(row.values())
                     )
 
-
-                raw = output.getvalue().encode()
-
+                raw = (
+                    output
+                    .getvalue()
+                    .encode()
+                )
 
                 self.send_response(
                     200
                 )
-
 
                 self.send_header(
                     "Content-Type",
                     "text/csv"
                 )
 
-
                 self.send_header(
                     "Content-Disposition",
                     "attachment; filename=bucket_history.csv"
                 )
-
 
                 self.send_header(
                     "Content-Length",
                     str(len(raw))
                 )
 
-
                 self.end_headers()
-
 
                 self.wfile.write(
                     raw
@@ -4176,12 +4430,16 @@ class Handler(
         except Exception as e:
 
             json_response(
+
                 self,
+
                 {
                     "error":
                         str(e)
                 },
+
                 500
+
             )
 
 
@@ -4194,13 +4452,12 @@ class Handler(
         try:
 
             path = urlparse(
-                    self.path
-                ).path
-
+                self.path
+            ).path
 
             data = read_json(
-                    self
-                )
+                self
+            )
 
 
             # =============================================
@@ -4211,14 +4468,17 @@ class Handler(
 
                 reset_tracker()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True,
+
                         "message":
                             "Tracker reset"
                     }
+
                 )
 
 
@@ -4228,13 +4488,14 @@ class Handler(
 
             if path == "/api/detect":
 
-                result =process_frame(
-                        data.get(
-                            "image",
-                            ""
-                        )
+                result = process_frame(
+
+                    data.get(
+                        "image",
+                        ""
                     )
 
+                )
 
                 return json_response(
                     self,
@@ -4248,36 +4509,45 @@ class Handler(
 
             if path == "/api/settings":
 
-                value =float(
-                        data.get(
-                            "line_position",
-                            55
-                        )
+                value = float(
+
+                    data.get(
+                        "line_position",
+                        55
                     )
 
-
-                value = max(
-                        5,
-                        min(
-                            95,
-                            value
-                        )
-                    )
-
-
-                set_setting(
-                    "line_position",
-                    value
                 )
 
+                value = max(
+
+                    5,
+
+                    min(
+                        95,
+                        value
+                    )
+
+                )
+
+                set_setting(
+
+                    "line_position",
+
+                    value
+
+                )
 
                 return json_response(
+
                     self,
+
                     {
                         "ok": True,
+
                         "message":
                             "Line position saved"
                     }
+
                 )
 
 
@@ -4288,76 +4558,88 @@ class Handler(
             if path == "/api/buckets":
 
                 name = str(
-                        data.get(
-                            "name",
-                            ""
-                        )
-                    ).strip()
 
-
-                capacity =float(
-                        data.get(
-                            "capacity",
-                            0
-                        )
-                        or 0
+                    data.get(
+                        "name",
+                        ""
                     )
 
+                ).strip()
+
+                capacity = float(
+
+                    data.get(
+                        "capacity",
+                        0
+                    )
+                    or 0
+
+                )
 
                 if not name:
 
                     return json_response(
+
                         self,
+
                         {
                             "error":
                                 "Bucket name is required"
                         },
-                        400
-                    )
 
+                        400
+
+                    )
 
                 con = db()
 
+                cursor = con.execute(
 
-                cursor =con.execute(
-                        """
-                        INSERT INTO buckets
-                        (
-                            name,
-                            capacity,
-                            active,
-                            created_at
-                        )
-
-                        VALUES
-                        (?,?,1,?)
-                        """,
-                        (
-                            name,
-                            capacity,
-                            now()
-                        )
+                    """
+                    INSERT INTO buckets
+                    (
+                        name,
+                        capacity,
+                        active,
+                        created_at
                     )
 
+                    VALUES
+                    (?,?,1,?)
+
+                    RETURNING id
+                    """,
+
+                    (
+                        name,
+
+                        capacity,
+
+                        now()
+                    )
+
+                )
+
+                bucket_id = cursor.fetchone()["id"]
 
                 con.commit()
 
-
-                bucket_id = cursor.lastrowid
-
-
                 con.close()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True,
+
                         "id":
                             bucket_id,
+
                         "message":
                             "Bucket saved"
                     }
+
                 )
 
 
@@ -4367,15 +4649,15 @@ class Handler(
 
             if path == "/api/buckets/activate":
 
-                bucket_id =int(
-                        data.get(
-                            "id"
-                        )
+                bucket_id = int(
+
+                    data.get(
+                        "id"
                     )
 
+                )
 
                 con = db()
-
 
                 con.execute(
                     """
@@ -4384,27 +4666,31 @@ class Handler(
                     """
                 )
 
-
                 con.execute(
                     """
                     UPDATE buckets
                     SET active=1
                     WHERE id=?
                     """,
-                    (bucket_id,)
-                )
 
+                    (
+                        bucket_id,
+                    )
+
+                )
 
                 con.commit()
 
                 con.close()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True
                     }
+
                 )
 
 
@@ -4415,39 +4701,41 @@ class Handler(
             if path == "/api/buckets/photo":
 
                 bucket_id = int(
-                        data.get(
-                            "bucket_id"
-                        )
+
+                    data.get(
+                        "bucket_id"
                     )
 
+                )
 
-                image =data.get(
-                        "image",
-                        ""
-                    )
-
+                image = data.get(
+                    "image",
+                    ""
+                )
 
                 raw = data_url_to_bytes(
-                        image
-                    )
-
+                    image
+                )
 
                 if len(raw) > 8 * 1024 * 1024:
 
                     return json_response(
+
                         self,
+
                         {
                             "error":
                                 "Image too large"
                         },
-                        400
-                    )
 
+                        400
+
+                    )
 
                 con = db()
 
-
                 con.execute(
+
                     """
                     INSERT INTO bucket_images
                     (
@@ -4460,33 +4748,43 @@ class Handler(
                     VALUES
                     (?,?,?,?)
                     """,
+
                     (
+
                         bucket_id,
 
                         str(
+
                             data.get(
+
                                 "filename",
+
                                 "photo.jpg"
+
                             )
+
                         ),
 
                         image,
 
                         now()
-                    )
-                )
 
+                    )
+
+                )
 
                 con.commit()
 
                 con.close()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True
                     }
+
                 )
 
 
@@ -4497,162 +4795,200 @@ class Handler(
             if path == "/api/training/image":
 
                 image = data.get(
-                        "image",
-                        ""
-                    )
-
+                    "image",
+                    ""
+                )
 
                 raw = data_url_to_bytes(
-                        image
-                    )
-
+                    image
+                )
 
                 if len(raw) > 12 * 1024 * 1024:
 
                     return json_response(
+
                         self,
+
                         {
                             "error":
                                 "Image too large"
                         },
+
                         400
+
                     )
 
+                class_id = int(
 
-                class_id =int(
-                        data.get(
-                            "class_id",
-                            0
-                        )
+                    data.get(
+                        "class_id",
+                        0
                     )
 
+                )
 
                 if (
+
                     class_id < 0
+
                     or
+
                     class_id >= len(
                         CLASS_NAMES
                     )
+
                 ):
 
                     return json_response(
+
                         self,
+
                         {
                             "error":
                                 "Invalid class"
                         },
+
                         400
+
                     )
 
+                x_center = float(
 
-                x_center =float(
-                        data.get(
-                            "x_center",
-                            0
-                        )
+                    data.get(
+                        "x_center",
+                        0
                     )
 
+                )
 
-                y_center =float(
-                        data.get(
-                            "y_center",
-                            0
-                        )
+                y_center = float(
+
+                    data.get(
+                        "y_center",
+                        0
                     )
 
+                )
 
                 box_width = float(
-                        data.get(
-                            "box_width",
-                            0
-                        )
+
+                    data.get(
+                        "box_width",
+                        0
                     )
 
+                )
 
-                box_height =float(
-                        data.get(
-                            "box_height",
-                            0
-                        )
+                box_height = float(
+
+                    data.get(
+                        "box_height",
+                        0
                     )
 
+                )
 
                 values = [
 
                     x_center,
+
                     y_center,
+
                     box_width,
+
                     box_height
 
                 ]
 
-
                 if any(
+
                     value < 0
-                    or value > 1
+
+                    or
+
+                    value > 1
+
                     for value in values
+
                 ):
 
                     return json_response(
+
                         self,
+
                         {
                             "error":
                                 "Invalid normalized box values"
                         },
-                        400
-                    )
 
+                        400
+
+                    )
 
                 con = db()
 
-
                 cursor = con.execute(
-                        """
-                        INSERT INTO dataset_images
-                        (
-                            filename,
-                            image_data,
-                            width,
-                            height,
-                            created_at
-                        )
 
-                        VALUES
-                        (?,?,?,?,?)
-                        """,
-                        (
-                            str(
-                                data.get(
-                                    "filename",
-                                    "image.jpg"
-                                )
-                            ),
-
-                            image,
-
-                            int(
-                                data.get(
-                                    "width",
-                                    0
-                                )
-                            ),
-
-                            int(
-                                data.get(
-                                    "height",
-                                    0
-                                )
-                            ),
-
-                            now()
-                        )
+                    """
+                    INSERT INTO dataset_images
+                    (
+                        filename,
+                        image_data,
+                        width,
+                        height,
+                        created_at
                     )
 
+                    VALUES
+                    (?,?,?,?,?)
 
-                image_id =cursor.lastrowid
+                    RETURNING id
+                    """,
 
+                    (
+
+                        str(
+
+                            data.get(
+
+                                "filename",
+
+                                "image.jpg"
+
+                            )
+
+                        ),
+
+                        image,
+
+                        int(
+
+                            data.get(
+                                "width",
+                                0
+                            )
+
+                        ),
+
+                        int(
+
+                            data.get(
+                                "height",
+                                0
+                            )
+
+                        ),
+
+                        now()
+
+                    )
+
+                )
+
+                image_id = cursor.fetchone()["id"]
 
                 con.execute(
+
                     """
                     INSERT INTO annotations
                     (
@@ -4669,7 +5005,9 @@ class Handler(
                     VALUES
                     (?,?,?,?,?,?,?,?)
                     """,
+
                     (
+
                         image_id,
 
                         class_id,
@@ -4687,24 +5025,29 @@ class Handler(
                         box_height,
 
                         now()
-                    )
-                )
 
+                    )
+
+                )
 
                 con.commit()
 
                 con.close()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True,
+
                         "id":
                             image_id,
+
                         "message":
                             "Image and label saved"
                     }
+
                 )
 
 
@@ -4721,20 +5064,24 @@ class Handler(
                     ]:
 
                         return json_response(
+
                             self,
+
                             {
                                 "error":
                                     "Training already running"
                             },
-                            409
-                        )
 
+                            409
+
+                        )
 
                     TRAIN_STATUS.update(
 
                         running=True,
 
-                        message="Starting...",
+                        message=
+                            "Starting...",
 
                         progress=1,
 
@@ -4744,7 +5091,6 @@ class Handler(
 
                     )
 
-
                 threading.Thread(
 
                     target=train_worker,
@@ -4753,14 +5099,17 @@ class Handler(
 
                 ).start()
 
-
                 return json_response(
+
                     self,
+
                     {
                         "ok": True,
+
                         "message":
                             "Training started"
                     }
+
                 )
 
 
@@ -4773,12 +5122,16 @@ class Handler(
         except Exception as e:
 
             json_response(
+
                 self,
+
                 {
                     "error":
                         str(e)
                 },
+
                 500
+
             )
 
 
@@ -4788,9 +5141,6 @@ class Handler(
 
 if __name__ == "__main__":
 
-    init_db()
-
-
     print("=" * 60)
 
     print(
@@ -4798,25 +5148,38 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Server: http://127.0.0.1:{PORT}"
+        "Database: Supabase PostgreSQL"
     )
 
     print(
-        f"YOLO installed: {YOLO_AVAILABLE}"
+        f"Server port: {PORT}"
     )
 
     print(
-        f"Model ready: "
-        f"{os.path.exists(MODEL_FILE)}"
+        f"PostgreSQL installed: "
+        f"{POSTGRES_AVAILABLE}"
+    )
+
+    print(
+        f"YOLO installed: "
+        f"{YOLO_AVAILABLE}"
+    )
+
+    print(
+        f"OpenCV installed: "
+        f"{CV_AVAILABLE}"
     )
 
     print("=" * 60)
 
+    init_db()
 
-    server =ThreadingHTTPServer(
-            (HOST, PORT),
-            Handler
-        )
-
+    server = ThreadingHTTPServer(
+        (
+            HOST,
+            PORT
+        ),
+        Handler
+    )
 
     server.serve_forever()
