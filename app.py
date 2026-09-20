@@ -28,11 +28,25 @@ def init_db():
             id BIGSERIAL PRIMARY KEY, filename TEXT NOT NULL, image_data BYTEA NOT NULL,
             labeled BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW())''')
         c.execute('ALTER TABLE dataset_images ADD COLUMN IF NOT EXISTS labeled BOOLEAN DEFAULT FALSE')
+        c.execute('ALTER TABLE dataset_images ALTER COLUMN created_at SET DEFAULT NOW()')
         c.execute('''CREATE TABLE IF NOT EXISTS annotations (
             id BIGSERIAL PRIMARY KEY, image_id BIGINT NOT NULL REFERENCES dataset_images(id) ON DELETE CASCADE,
             class_name TEXT NOT NULL, x_center DOUBLE PRECISION NOT NULL, y_center DOUBLE PRECISION NOT NULL,
             width DOUBLE PRECISION NOT NULL, height DOUBLE PRECISION NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())''')
         c.execute('UPDATE dataset_images SET labeled=TRUE WHERE id IN (SELECT DISTINCT image_id FROM annotations)')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS width DOUBLE PRECISION')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS height DOUBLE PRECISION')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS class_name TEXT')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS x_center DOUBLE PRECISION')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS y_center DOUBLE PRECISION')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS image_id BIGINT')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS box_width DOUBLE PRECISION DEFAULT 0')
+        c.execute('ALTER TABLE annotations ADD COLUMN IF NOT EXISTS box_height DOUBLE PRECISION DEFAULT 0')
+        c.execute('ALTER TABLE annotations ALTER COLUMN created_at SET DEFAULT NOW()')
+        c.execute('ALTER TABLE annotations ALTER COLUMN class_id DROP NOT NULL') if 'class_id' in annotation_columns() else None
+        c.execute('ALTER TABLE annotations ALTER COLUMN box_width DROP NOT NULL')
+        c.execute('ALTER TABLE annotations ALTER COLUMN box_height DROP NOT NULL')
+        c.execute('UPDATE annotations SET created_at=NOW() WHERE created_at IS NULL')
         c.execute('''CREATE TABLE IF NOT EXISTS training_state (
             id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'WAITING', progress INTEGER NOT NULL DEFAULT 0,
             message TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())''')
@@ -176,7 +190,33 @@ function takePhoto(){const v=document.getElementById('trainVideo');if(!v.videoWi
 function cancelImage(){currentImage=null;currentFilename='';boxes=[];document.getElementById('editor').classList.add('hidden');document.getElementById('fileInput').value='';document.getElementById('fileName').textContent='No file chosen';closeCamera()}
 function imageData(){const c=document.createElement('canvas'),scale=Math.min(1,1280/currentImage.naturalWidth);c.width=Math.round(currentImage.naturalWidth*scale);c.height=Math.round(currentImage.naturalHeight*scale);c.getContext('2d').drawImage(currentImage,0,0,c.width,c.height);return c.toDataURL('image/jpeg',0.82)}
 async function saveImage(){const msg=document.getElementById('saveMsg');if(!currentImage){msg.textContent='Choose an image first.';return}if(!boxes.length){msg.textContent='Draw at least one box.';return}msg.textContent='Saving...';const annotations=boxes.map(b=>({class_name:b.className,x_center:(b.x+b.w/2)/canvas.width,y_center:(b.y+b.h/2)/canvas.height,width:b.w/canvas.width,height:b.h/canvas.height}));try{const r=await fetch('/api/training/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:currentFilename||'training.jpg',image_data:imageData(),annotations})});const j=await r.json();if(!j.ok){msg.textContent=j.error||'Save failed.';return}msg.textContent='✅ Saved successfully.';document.getElementById('total').textContent=j.summary.total;document.getElementById('labeled').textContent=j.summary.labeled;document.getElementById('ann').textContent=j.summary.annotations;setTimeout(cancelImage,1000)}catch(e){msg.textContent='Save error: '+e.message}}
+</script>
+<div class="card">
+<h2>🖼️ Training Images Gallery</h2>
+<p class="muted">Review images zilizohifadhiwa, badilisha class ya box, au futa image.</p>
+<div id="gallery" class="grid"><p class="muted">Loading...</p></div>
+</div>
+<div id="reviewBox" class="card hidden">
+<h2>🔍 Review Training Image</h2>
+<p id="reviewName" class="muted"></p>
+<div style="text-align:center;background:#0f172a;padding:10px;border-radius:12px"><img id="reviewImage" style="max-width:100%;max-height:600px;border-radius:8px"></div>
+<div id="reviewAnnotations" style="margin-top:12px"></div>
+<div class="row" style="margin-top:12px"><button type="button" class="secondary" onclick="closeReview()">CLOSE</button><button type="button" class="danger" onclick="deleteReviewedImage()">🗑️ DELETE IMAGE</button></div>
+<p id="reviewMsg" class="notice"></p>
+</div>
+<script>
+let reviewedId=null;
+function escapeHtml(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
+async function loadGallery(){const el=document.getElementById('gallery');try{const r=await fetch('/api/training/images');const j=await r.json();if(!j.ok){el.innerHTML='<p class="muted">'+escapeHtml(j.error)+'</p>';return}if(!j.images.length){el.innerHTML='<p class="muted">No training images yet.</p>';return}el.innerHTML=j.images.map(x=>'<div class="card" style="margin:0;border:1px solid #e2e8f0;box-shadow:none"><img src="/api/training/image/'+x.id+'" style="width:100%;height:180px;object-fit:cover;border-radius:9px"><b>'+escapeHtml(x.filename)+'</b><p class="muted">Boxes: '+x.annotation_count+' | '+escapeHtml(x.created_at||'')+'</p><div class="row"><button type="button" onclick="reviewImage('+x.id+')">🔍 REVIEW</button><button type="button" class="danger" onclick="deleteImage('+x.id+')">🗑️ DELETE</button></div></div>').join('')}catch(e){el.innerHTML='<p class="muted">Gallery error: '+escapeHtml(e.message)+'</p>'}}
+async function refreshGallery(){loadGallery()}
+async function reviewImage(id){reviewedId=id;const box=document.getElementById('reviewBox');box.classList.remove('hidden');document.getElementById('reviewMsg').textContent='Loading...';try{const r=await fetch('/api/training/image/'+id+'/detail');const j=await r.json();if(!j.ok){document.getElementById('reviewMsg').textContent=j.error;return}document.getElementById('reviewName').textContent=j.image.filename;document.getElementById('reviewImage').src='/api/training/image/'+id;document.getElementById('reviewAnnotations').innerHTML=j.annotations.map((a,i)=>'<div class="classbox"><b>'+(i+1)+'. '+escapeHtml(a.class_name)+'</b><select id="editClass'+a.id+'"><option value="BUCKET_LOADED">BUCKET_LOADED</option><option value="BUCKET_EMPTY">BUCKET_EMPTY</option><option value="PEOPLE">PEOPLE</option><option value="EQUIPMENT">EQUIPMENT</option></select><button type="button" class="green" onclick="updateAnnotation('+a.id+')">SAVE CLASS</button></div>').join('');j.annotations.forEach(a=>{document.getElementById('editClass'+a.id).value=a.class_name});document.getElementById('reviewMsg').textContent=''}catch(e){document.getElementById('reviewMsg').textContent=e.message}}
+function closeReview(){document.getElementById('reviewBox').classList.add('hidden');reviewedId=null}
+async function updateAnnotation(id){const cls=document.getElementById('editClass'+id).value;const r=await fetch('/api/training/annotation/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({class_name:cls})});const j=await r.json();document.getElementById('reviewMsg').textContent=j.ok?'✅ Class updated.':(j.error||'Update failed.');if(j.ok)loadGallery()}
+async function deleteImage(id){if(!confirm('Delete this training image and all its annotations?'))return;const r=await fetch('/api/training/image/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok){alert(j.error||'Delete failed.');return}document.getElementById('reviewBox').classList.add('hidden');reviewedId=null;loadGallery();location.reload()}
+async function deleteReviewedImage(){if(reviewedId)await deleteImage(reviewedId)}
+loadGallery();
 </script>''' % ('READY' if ready else 'NOT READY',s['total'],s['labeled'],s['annotations'],message,prog,prog)
+
     return layout('AI Training',body,'AI Training')
 
 
@@ -188,6 +228,47 @@ def settings_page():
     return layout('Settings','<div class="card"><h1>⚙️ Settings</h1><div class="classbox"><b>Counting rule</b><br>Only BUCKET_LOADED is counted.</div><div class="classbox"><b>Not counted</b><br>BUCKET_EMPTY, PEOPLE and EQUIPMENT.</div><div class="classbox"><b>Database</b><br>Supabase PostgreSQL</div></div>','Settings')
 
 
+def class_counts():
+    conn=db()
+    try:
+        c=conn.cursor()
+        c.execute('SELECT class_name, COUNT(*) FROM annotations GROUP BY class_name')
+        out={k:0 for k in CLASSES}
+        for k,v in c.fetchall():
+            if k in out: out[k]=int(v)
+        return out
+    finally:
+        conn.close()
+
+
+def training_images():
+    conn=db()
+    try:
+        c=conn.cursor(cursor_factory=RealDictCursor)
+        c.execute('''SELECT d.id,d.filename,d.created_at,d.labeled,COUNT(a.id) AS annotation_count
+                     FROM dataset_images d LEFT JOIN annotations a ON a.image_id=d.id
+                     GROUP BY d.id ORDER BY d.id DESC''')
+        rows=[]
+        for r in c.fetchall():
+            r=dict(r)
+            if r.get('created_at'): r['created_at']=r['created_at'].isoformat()
+            r['annotation_count']=int(r.get('annotation_count') or 0)
+            rows.append(r)
+        return rows
+    finally:
+        conn.close()
+
+
+def annotation_columns():
+    conn=db()
+    try:
+        c=conn.cursor()
+        c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='annotations'")
+        return {r[0] for r in c.fetchall()}
+    finally:
+        conn.close()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): print('%s - %s' % (self.address_string(), fmt % args))
     def do_GET(self):
@@ -196,8 +277,36 @@ class Handler(BaseHTTPRequestHandler):
             pages={'/':dashboard_page,'/camera':camera_page,'/buckets':buckets_page,'/training':training_page,'/history':history_page,'/settings':settings_page}
             if p in pages: send_html(self,pages[p]()); return
             if p=='/api/status': send_json(self,{'ok':True,'database':'Supabase PostgreSQL','model_ready':model_ready(),'training':training_state()}); return
-            if p=='/api/training/summary': send_json(self,{'ok':True,'summary':summary(),'state':training_state(),'model_ready':model_ready()}); return
+            if p=='/api/training/summary': send_json(self,{'ok':True,'summary':summary(),'classes':class_counts(),'state':training_state(),'model_ready':model_ready()}); return
             if p=='/api/model/status': send_json(self,{'ok':True,'ready':model_ready()}); return
+            if p=='/api/training/images': send_json(self,{'ok':True,'images':training_images()}); return
+            if p.startswith('/api/training/image/') and p.endswith('/detail'):
+                iid=int(p.split('/')[4])
+                conn=db()
+                try:
+                    c=conn.cursor(cursor_factory=RealDictCursor)
+                    c.execute('SELECT id,filename,created_at,labeled FROM dataset_images WHERE id=%s',(iid,)); img=c.fetchone()
+                    if not img: send_json(self,{'ok':False,'error':'Image not found.'},404); return
+                    c.execute('SELECT id,class_name,x_center,y_center,width,height FROM annotations WHERE image_id=%s ORDER BY id',(iid,)); anns=[dict(x) for x in c.fetchall()]
+                    img=dict(img)
+                    if img.get('created_at'): img['created_at']=img['created_at'].isoformat()
+                    send_json(self,{'ok':True,'image':img,'annotations':anns})
+                finally: conn.close()
+                return
+            if p.startswith('/api/training/image/'):
+                iid=int(p.rsplit('/',1)[1])
+                conn=db()
+                try:
+                    c=conn.cursor(); c.execute('SELECT image_data,filename FROM dataset_images WHERE id=%s',(iid,)); row=c.fetchone()
+                    if not row: send_json(self,{'ok':False,'error':'Image not found.'},404); return
+                    raw,filename=row; mime='image/jpeg'
+                    if str(filename).lower().endswith('.png'): mime='image/png'
+                    elif str(filename).lower().endswith('.webp'): mime='image/webp'
+                    try:
+                        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(bytes(raw))
+                    except (BrokenPipeError,ConnectionResetError): pass
+                finally: conn.close()
+                return
             send_json(self,{'ok':False,'error':'Not found'},404)
         except Exception as e: traceback.print_exc(); send_json(self,{'ok':False,'error':str(e)},500)
     def do_POST(self):
@@ -206,10 +315,21 @@ class Handler(BaseHTTPRequestHandler):
             if p=='/api/buckets': self.add_bucket(d)
             elif p=='/api/training/image': self.add_training_image(d)
             elif p=='/api/training/state': self.update_training_state(d)
+            elif p.startswith('/api/training/annotation/'):
+                self.update_annotation(int(p.rsplit('/',1)[1]),d)
             elif p=='/api/train': send_json(self,{'ok':True,'message':'Ready for external YOLO training.','summary':summary()})
             else: send_json(self,{'ok':False,'error':'Not found'},404)
         except ValueError as e: send_json(self,{'ok':False,'error':str(e)},400)
         except Exception as e: traceback.print_exc(); send_json(self,{'ok':False,'error':str(e)},500)
+    def do_DELETE(self):
+        try:
+            p=urlparse(self.path).path
+            if p.startswith('/api/training/image/'):
+                self.delete_training_image(int(p.rsplit('/',1)[1])); return
+            send_json(self,{'ok':False,'error':'Not found'},404)
+        except ValueError as e: send_json(self,{'ok':False,'error':str(e)},400)
+        except Exception as e: traceback.print_exc(); send_json(self,{'ok':False,'error':str(e)},500)
+
     def add_bucket(self,d):
         name=str(d.get('bucket_name','')).strip()
         if not name: send_json(self,{'ok':False,'error':'Bucket name is required.'},400); return
@@ -234,11 +354,41 @@ class Handler(BaseHTTPRequestHandler):
             clean.append((cls,x,y,w,h))
         conn=db()
         try:
-            c=conn.cursor(); c.execute('INSERT INTO dataset_images(filename,image_data,labeled) VALUES(%s,%s,TRUE) RETURNING id',(str(d.get('filename') or 'training.jpg'),psycopg2.Binary(raw))); iid=c.fetchone()[0]
-            for a in clean: c.execute('INSERT INTO annotations(image_id,class_name,x_center,y_center,width,height) VALUES(%s,%s,%s,%s,%s,%s)',(iid,*a))
-            conn.commit(); send_json(self,{'ok':True,'image_id':iid,'summary':summary()})
+            c=conn.cursor(); c.execute('INSERT INTO dataset_images(filename,image_data,labeled,created_at) VALUES(%s,%s,TRUE,NOW()) RETURNING id',(str(d.get('filename') or 'training.jpg'),psycopg2.Binary(raw))); iid=c.fetchone()[0]
+            cols=annotation_columns()
+            for cls,x,y,w,h in clean:
+                names=['image_id','class_name','x_center','y_center','width','height']; vals=[iid,cls,x,y,w,h]
+                if 'class_id' in cols: names.insert(1,'class_id'); vals.insert(1,None)
+                if 'box_width' in cols: names.append('box_width'); vals.append(w)
+                if 'box_height' in cols: names.append('box_height'); vals.append(h)
+                if 'created_at' in cols: names.append('created_at')
+                placeholders=[]; final_vals=[]
+                for n,v in zip(names,vals):
+                    if n=='created_at': placeholders.append('NOW()')
+                    else: placeholders.append('%s'); final_vals.append(v)
+                c.execute('INSERT INTO annotations('+','.join(names)+') VALUES('+','.join(placeholders)+')',tuple(final_vals))
+            conn.commit(); send_json(self,{'ok':True,'image_id':iid,'summary':summary(),'classes':class_counts()})
         except Exception: conn.rollback(); raise
         finally: conn.close()
+
+    def update_annotation(self,aid,d):
+        cls=str(d.get('class_name',''))
+        if cls not in CLASSES: send_json(self,{'ok':False,'error':'Invalid class.'},400); return
+        conn=db()
+        try:
+            c=conn.cursor(); c.execute('UPDATE annotations SET class_name=%s WHERE id=%s',(cls,aid))
+            if c.rowcount==0: conn.rollback(); send_json(self,{'ok':False,'error':'Annotation not found.'},404); return
+            conn.commit(); send_json(self,{'ok':True,'classes':class_counts()})
+        finally: conn.close()
+
+    def delete_training_image(self,iid):
+        conn=db()
+        try:
+            c=conn.cursor(); c.execute('DELETE FROM dataset_images WHERE id=%s',(iid,))
+            if c.rowcount==0: conn.rollback(); send_json(self,{'ok':False,'error':'Image not found.'},404); return
+            conn.commit(); send_json(self,{'ok':True,'summary':summary(),'classes':class_counts()})
+        finally: conn.close()
+
     def update_training_state(self,d):
         conn=db()
         try:
