@@ -163,15 +163,15 @@ def buckets_page():
 
 def training_page():
     s=summary(); st=training_state(); ready=model_ready(); prog=int(st.get('progress') or 0); message=esc(st.get('message') or st.get('status'))
-    body='''<div class="card"><h1>🤖 AI Training</h1><p>Database: <span class="badge">Supabase PostgreSQL</span> | YOLO: <span class="badge">AVAILABLE FOR MODEL USE</span> | Model: <span class="badge">%s</span></p></div>
+    body='''<div class="card"><h1>🤖 AI Training</h1><p>Database: <span class="badge">Supabase PostgreSQL</span> | YOLO: <span class="badge">AVAILABLE FOR MODEL USE</span> | Model: <span class="badge">__MODEL__</span></p></div>
 <div class="card"><h2>Classes</h2><div class="classbox"><b>BUCKET_LOADED</b> = count</div><div class="classbox"><b>BUCKET_EMPTY</b> = no count</div><div class="classbox"><b>PEOPLE</b> = no count</div><div class="classbox"><b>EQUIPMENT</b> = no count</div></div>
 <div class="card"><h2>➕ Add Training Image</h2><p class="muted">Piga picha au chagua picha kutoka kwenye simu/computer. Kisha chora box kuzunguka object unayotaka AI ijifunze.</p><p class="muted">Unaweza kuweka objects nyingi kwenye picha moja.</p>
 <input id="fileInput" type="file" accept="image/*" style="display:none" onchange="handleFile(this)">
 <div class="row"><button type="button" onclick="document.getElementById('fileInput').click()">📁 CHOOSE IMAGE</button><button type="button" class="secondary" onclick="openCamera()">📷 OPEN CAMERA</button><button type="button" class="danger" onclick="clearBoxes()">🗑️ CLEAR ALL BOXES</button></div>
 <p id="fileName" class="muted">No file chosen</p><div id="cameraBox" class="camera-wrap hidden"><video id="trainVideo" autoplay playsinline></video><div class="row" style="margin-top:10px"><button onclick="takePhoto()">📸 TAKE PHOTO</button><button class="secondary" onclick="closeCamera()">CLOSE CAMERA</button></div></div>
 <div id="editor" class="hidden"><label>Class:</label><select id="classSelect"><option value="BUCKET_LOADED">BUCKET_LOADED — COUNT</option><option value="BUCKET_EMPTY">BUCKET_EMPTY — NO COUNT</option><option value="PEOPLE">PEOPLE — NO COUNT</option><option value="EQUIPMENT">EQUIPMENT — NO COUNT</option></select><p class="muted">Chagua class kisha drag kwenye picha kuchora box.</p><div id="canvasWrap"><canvas id="canvas"></canvas></div><div id="boxList"></div><button class="green" onclick="saveImage()">💾 SAVE TRAINING IMAGE</button> <button class="secondary" onclick="cancelImage()">CANCEL</button><p id="saveMsg" class="muted"></p></div></div>
-<div class="card"><h2>Dataset</h2><div class="grid"><div class="stat">Total images<b id="total">%s</b></div><div class="stat">Labeled<b id="labeled">%s</b></div><div class="stat">Annotations<b id="ann">%s</b></div></div></div>
-<div class="card"><h2>Training status</h2><p>%s</p><div style="height:18px;background:#e2e8f0;border-radius:20px;overflow:hidden"><div style="height:100%%;width:%s%%;background:#2563eb"></div></div><p>%s%%</p><div class="notice">⚠️ YOLO training is not executed inside the Render Web Service. Images and labels are safely stored in Supabase PostgreSQL. After a trained model is uploaded, the system will use it for bucket detection.</div></div>
+<div class="card"><h2>Dataset</h2><div class="grid"><div class="stat">Total images<b id="total">__TOTAL__</b></div><div class="stat">Labeled<b id="labeled">__LABELED__</b></div><div class="stat">Annotations<b id="ann">__ANN__</b></div></div></div>
+<div class="card"><h2>Training status</h2><p>__MESSAGE__</p><div style="height:18px;background:#e2e8f0;border-radius:20px;overflow:hidden"><div style="height:100%;width:__PROGRESS__%;background:#2563eb"></div></div><p>__PROGRESS__%</p><div class="notice">⚠️ YOLO training is not executed inside the Render Web Service. Images and labels are safely stored in Supabase PostgreSQL. After a trained model is uploaded, the system will use it for bucket detection.</div></div>
 <script>
 let currentImage=null,currentFilename='',boxes=[],drawing=false,sx=0,sy=0,tempBox=null,cameraStream=null;const canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
 function handleFile(input){const file=input.files&&input.files[0];if(!file)return;currentFilename=file.name;document.getElementById('fileName').textContent=file.name;const reader=new FileReader();reader.onload=e=>loadImage(e.target.result,file.name);reader.readAsDataURL(file)}
@@ -215,7 +215,7 @@ async function updateAnnotation(id){const cls=document.getElementById('editClass
 async function deleteImage(id){if(!confirm('Delete this training image and all its annotations?'))return;const r=await fetch('/api/training/image/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok){alert(j.error||'Delete failed.');return}document.getElementById('reviewBox').classList.add('hidden');reviewedId=null;loadGallery();location.reload()}
 async function deleteReviewedImage(){if(reviewedId)await deleteImage(reviewedId)}
 loadGallery();
-</script>''' % ('READY' if ready else 'NOT READY',s['total'],s['labeled'],s['annotations'],message,prog,prog)
+</script>'''.replace('__MODEL__', 'READY' if ready else 'NOT READY').replace('__TOTAL__', str(s['total'])).replace('__LABELED__', str(s['labeled'])).replace('__ANN__', str(s['annotations'])).replace('__MESSAGE__', message).replace('__PROGRESS__', str(prog))
 
     return layout('AI Training',body,'AI Training')
 
