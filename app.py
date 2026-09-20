@@ -366,7 +366,7 @@ class Handler(BaseHTTPRequestHandler):
         conn=db()
         try:
             c=conn.cursor(cursor_factory=RealDictCursor)
-            c.execute("SELECT id,filename,encode(image_data, 'base64') AS image_b64 FROM dataset_images ORDER BY id ASC")
+            c.execute("SELECT id,filename,image_data FROM dataset_images ORDER BY id ASC")
             images=[dict(x) for x in c.fetchall()]
             if not images:
                 send_json(self,{'ok':False,'error':'No training images found.'},400); return
@@ -441,7 +441,7 @@ names:
             for split,items in (('train',train_rows),('val',val_rows)):
                 for img,anns in items:
                     fname=safe_filename(img.get('filename'),img.get('id'))
-                    z.writestr(f'images/{split}/{fname}',image_bytes(img.get('image_b64')))
+                    z.writestr(f'images/{split}/{fname}',image_bytes(img.get('image_data')))
                     z.writestr(f'labels/{split}/{os.path.splitext(fname)[0]}.txt',make_label(anns))
                     manifest.append({'image_id':img.get('id'),'filename':img.get('filename'),'split':split,'annotations':len(anns)})
             z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
