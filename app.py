@@ -393,23 +393,61 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Image data is missing.')
             if isinstance(raw,str):
                 raw=raw.strip()
+                # Some PostgreSQL clients/old records may expose BYTEA as
+                # PostgreSQL hex text (\\xFFD8...). Decode that first.
+                if raw.startswith('\\x'):
+                    hx=raw[2:].strip()
+                    try:
+                        b=bytes.fromhex(hx)
+                        if b:
+                            return b
+                    except Exception:
+                        pass
+                # Also handle a quoted JSON/string representation.
+                if len(raw)>=2 and raw[0]==raw[-1] and raw[0] in ('"', "'"):
+                    raw=raw[1:-1].strip()
                 if raw.startswith('data:image/') and ',' in raw:
                     raw=raw.split(',',1)[1].strip()
-                # PostgreSQL encode(..., 'base64') may contain line breaks.
-                raw=''.join(raw.split())
-                if not raw:
-                    raise ValueError('Image data is empty.')
-                # Add harmless padding when needed. A remainder of 1 is never
-                # valid Base64, so fail with a useful message instead.
-                rem=len(raw)%4
-                if rem==1:
-                    raise ValueError('Invalid image Base64 data.')
-                if rem:
-                    raw += '='*(4-rem)
+                # If this is already an image represented as a latin-1 string,
+                # preserve it rather than trying to interpret it as Base64.
                 try:
-                    return base64.b64decode(raw,validate=True)
-                except Exception as e:
-                    raise ValueError('Invalid image Base64 data.') from e
+                    latin=raw.encode('latin-1')
+                    if latin.startswith((b'\xff\xd8\xff',b'\x89PNG\r\n\x1a\n',b'RIFF',b'GIF8',b'BM')):
+                        return latin
+                except Exception:
+                    pass
+                # Normal Base64 text. Remove whitespace and restore harmless
+                # padding where possible. A remainder of 1 can never be valid.
+                compact=''.join(raw.split())
+                if not compact:
+                    raise ValueError('Image data is empty.')
+                rem=len(compact)%4
+                if rem==1:
+                    # Last-resort: PostgreSQL BYTEA may have been converted to
+                    # hex without the \x prefix. Try that before failing.
+                    try:
+                        b=bytes.fromhex(compact)
+                        if b:
+                            return b
+                    except Exception:
+                        pass
+                    raise ValueError('Invalid image data format.')
+                if rem:
+                    compact += '='*(4-rem)
+                try:
+                    decoded=base64.b64decode(compact,validate=True)
+                    if decoded:
+                        return decoded
+                except Exception:
+                    pass
+                # Last attempt for plain hexadecimal BYTEA text.
+                try:
+                    b=bytes.fromhex(compact)
+                    if b:
+                        return b
+                except Exception:
+                    pass
+                raise ValueError('Invalid image data format.')
             if isinstance(raw,(bytes,bytearray,memoryview)):
                 b=bytes(raw)
                 # Normal PostgreSQL BYTEA: the value is already the original
