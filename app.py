@@ -411,7 +411,35 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     raise ValueError('Invalid image Base64 data.') from e
             if isinstance(raw,(bytes,bytearray,memoryview)):
-                return bytes(raw)
+                b=bytes(raw)
+                # Normal PostgreSQL BYTEA: the value is already the original
+                # image bytes. Do NOT Base64-decode real JPEG/PNG/WebP data.
+                if b.startswith(b'\xff\xd8\xff') or b.startswith(b'\x89PNG\r\n\x1a\n') or b.startswith(b'RIFF') or b.startswith(b'GIF8') or b.startswith(b'BM'):
+                    return b
+                # Some older records may contain a data URI or Base64 text
+                # inside the BYTEA column. Handle those records too.
+                try:
+                    text=b.decode('utf-8').strip()
+                except UnicodeDecodeError:
+                    return b
+                if text.startswith('data:image/') and ',' in text:
+                    text=text.split(',',1)[1].strip()
+                compact=''.join(text.split())
+                if compact:
+                    rem=len(compact)%4
+                    if rem==1:
+                        # It is not valid Base64; preserve the original bytes
+                        # rather than incorrectly rejecting a valid image format.
+                        return b
+                    if rem:
+                        compact += '='*(4-rem)
+                    try:
+                        decoded=base64.b64decode(compact,validate=True)
+                        if decoded.startswith((b'\xff\xd8\xff',b'\x89PNG\r\n\x1a\n',b'RIFF',b'GIF8',b'BM')):
+                            return decoded
+                    except Exception:
+                        pass
+                return b
             return bytes(raw)
         def make_label(anns):
             lines=[]
