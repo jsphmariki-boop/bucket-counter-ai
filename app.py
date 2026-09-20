@@ -366,7 +366,7 @@ class Handler(BaseHTTPRequestHandler):
         conn=db()
         try:
             c=conn.cursor(cursor_factory=RealDictCursor)
-            c.execute("SELECT id,filename,image_data FROM dataset_images ORDER BY id ASC")
+            c.execute("SELECT id,filename,encode(image_data, 'base64') AS image_b64 FROM dataset_images ORDER BY id ASC")
             images=[dict(x) for x in c.fetchall()]
             if not images:
                 send_json(self,{'ok':False,'error':'No training images found.'},400); return
@@ -389,9 +389,29 @@ class Handler(BaseHTTPRequestHandler):
             clean=''.join(ch if ch.isalnum() or ch in ('-','_') else '_' for ch in root).strip('_') or 'image'
             return f'{iid}_{clean}{ext}'
         def image_bytes(raw):
+            if raw is None:
+                raise ValueError('Image data is missing.')
             if isinstance(raw,str):
-                if raw.startswith('data:image/') and ',' in raw: raw=raw.split(',',1)[1]
-                return base64.b64decode(raw)
+                raw=raw.strip()
+                if raw.startswith('data:image/') and ',' in raw:
+                    raw=raw.split(',',1)[1].strip()
+                # PostgreSQL encode(..., 'base64') may contain line breaks.
+                raw=''.join(raw.split())
+                if not raw:
+                    raise ValueError('Image data is empty.')
+                # Add harmless padding when needed. A remainder of 1 is never
+                # valid Base64, so fail with a useful message instead.
+                rem=len(raw)%4
+                if rem==1:
+                    raise ValueError('Invalid image Base64 data.')
+                if rem:
+                    raw += '='*(4-rem)
+                try:
+                    return base64.b64decode(raw,validate=True)
+                except Exception as e:
+                    raise ValueError('Invalid image Base64 data.') from e
+            if isinstance(raw,(bytes,bytearray,memoryview)):
+                return bytes(raw)
             return bytes(raw)
         def make_label(anns):
             lines=[]
@@ -421,7 +441,7 @@ names:
             for split,items in (('train',train_rows),('val',val_rows)):
                 for img,anns in items:
                     fname=safe_filename(img.get('filename'),img.get('id'))
-                    z.writestr(f'images/{split}/{fname}',image_bytes(img.get('image_data')))
+                    z.writestr(f'images/{split}/{fname}',image_bytes(img.get('image_b64')))
                     z.writestr(f'labels/{split}/{os.path.splitext(fname)[0]}.txt',make_label(anns))
                     manifest.append({'image_id':img.get('id'),'filename':img.get('filename'),'split':split,'annotations':len(anns)})
             z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
