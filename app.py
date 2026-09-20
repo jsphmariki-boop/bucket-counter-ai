@@ -121,7 +121,7 @@ def training_state():
         if not r:
             return {'status':'WAITING','progress':0,'message':'Ready for external YOLO training'}
         r=dict(r)
-        if r.get('updated_at'): r['updated_at']=r['updated_at'].isoformat()
+        if r.get('updated_at'): r['updated_at']=str(r['updated_at'])
         return r
     finally: conn.close()
 
@@ -251,7 +251,7 @@ def training_images():
         rows=[]
         for r in c.fetchall():
             r=dict(r)
-            if r.get('created_at'): r['created_at']=r['created_at'].isoformat()
+            if r.get('created_at'): r['created_at']=str(r['created_at'])
             r['annotation_count']=int(r.get('annotation_count') or 0)
             rows.append(r)
         return rows
@@ -289,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not img: send_json(self,{'ok':False,'error':'Image not found.'},404); return
                     c.execute('SELECT id,class_name,x_center,y_center,width,height FROM annotations WHERE image_id=%s ORDER BY id',(iid,)); anns=[dict(x) for x in c.fetchall()]
                     img=dict(img)
-                    if img.get('created_at'): img['created_at']=img['created_at'].isoformat()
+                    if img.get('created_at'): img['created_at']=str(img['created_at'])
                     send_json(self,{'ok':True,'image':img,'annotations':anns})
                 finally: conn.close()
                 return
