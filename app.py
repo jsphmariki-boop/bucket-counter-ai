@@ -1,4 +1,4 @@
-import os, json, base64, traceback, mimetypes
+import os, json, base64, traceback, mimetypes, io, zipfile, random
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import psycopg2
@@ -9,6 +9,7 @@ PORT = int(os.environ.get('PORT', '8080'))
 DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('SUPABASE_DB_URL') or os.environ.get('POSTGRES_URL')
 MAX_JSON_BYTES = 12 * 1024 * 1024
 CLASSES = {'BUCKET_LOADED':'count','BUCKET_EMPTY':'no count','PEOPLE':'no count','EQUIPMENT':'no count'}
+CLASS_IDS = {'BUCKET_LOADED':0,'BUCKET_EMPTY':1,'PEOPLE':2,'EQUIPMENT':3}
 
 
 def db():
@@ -192,6 +193,13 @@ function imageData(){const c=document.createElement('canvas'),scale=Math.min(1,1
 async function saveImage(){const msg=document.getElementById('saveMsg');if(!currentImage){msg.textContent='Choose an image first.';return}if(!boxes.length){msg.textContent='Draw at least one box.';return}msg.textContent='Saving...';const annotations=boxes.map(b=>({class_name:b.className,x_center:(b.x+b.w/2)/canvas.width,y_center:(b.y+b.h/2)/canvas.height,width:b.w/canvas.width,height:b.h/canvas.height}));try{const r=await fetch('/api/training/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:currentFilename||'training.jpg',image_data:imageData(),annotations})});const j=await r.json();if(!j.ok){msg.textContent=j.error||'Save failed.';return}msg.textContent='✅ Saved successfully.';document.getElementById('total').textContent=j.summary.total;document.getElementById('labeled').textContent=j.summary.labeled;document.getElementById('ann').textContent=j.summary.annotations;setTimeout(cancelImage,1000)}catch(e){msg.textContent='Save error: '+e.message}}
 </script>
 <div class="card">
+<h2>📦 YOLO Dataset</h2>
+<p class="muted">Export images na annotations zako kuwa dataset ya YOLO. Mfumo utagawanya dataset kuwa <b>train</b> na <b>val</b> automatically.</p>
+<div class="classbox"><b>Class IDs</b><br>0 = BUCKET_LOADED (count)<br>1 = BUCKET_EMPTY (no count)<br>2 = PEOPLE (no count)<br>3 = EQUIPMENT (no count)</div>
+<button type="button" class="green" onclick="exportYolo()">📦 EXPORT YOLO DATASET</button>
+<p id="exportMsg" class="muted"></p>
+</div>
+<div class="card">
 <h2>🖼️ Training Images Gallery</h2>
 <p class="muted">Review images zilizohifadhiwa, badilisha class ya box, au futa image.</p>
 <div id="gallery" class="grid"><p class="muted">Loading...</p></div>
@@ -214,6 +222,7 @@ function closeReview(){document.getElementById('reviewBox').classList.add('hidde
 async function updateAnnotation(id){const cls=document.getElementById('editClass'+id).value;const r=await fetch('/api/training/annotation/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({class_name:cls})});const j=await r.json();document.getElementById('reviewMsg').textContent=j.ok?'✅ Class updated.':(j.error||'Update failed.');if(j.ok)loadGallery()}
 async function deleteImage(id){if(!confirm('Delete this training image and all its annotations?'))return;const r=await fetch('/api/training/image/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok){alert(j.error||'Delete failed.');return}document.getElementById('reviewBox').classList.add('hidden');reviewedId=null;loadGallery();location.reload()}
 async function deleteReviewedImage(){if(reviewedId)await deleteImage(reviewedId)}
+async function exportYolo(){const msg=document.getElementById('exportMsg');msg.textContent='Preparing YOLO dataset...';try{const r=await fetch('/api/training/export-yolo');if(!r.ok){let t=await r.text();msg.textContent='Export failed: '+t;return}const blob=await r.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='bucket_counter_yolo_dataset.zip';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);msg.textContent='✅ YOLO dataset exported and downloaded.'}catch(e){msg.textContent='Export error: '+e.message}}
 loadGallery();
 </script>'''.replace('__MODEL__', 'READY' if ready else 'NOT READY').replace('__TOTAL__', str(s['total'])).replace('__LABELED__', str(s['labeled'])).replace('__ANN__', str(s['annotations'])).replace('__MESSAGE__', message).replace('__PROGRESS__', str(prog))
 
@@ -279,6 +288,7 @@ class Handler(BaseHTTPRequestHandler):
             if p=='/api/status': send_json(self,{'ok':True,'database':'Supabase PostgreSQL','model_ready':model_ready(),'training':training_state()}); return
             if p=='/api/training/summary': send_json(self,{'ok':True,'summary':summary(),'classes':class_counts(),'state':training_state(),'model_ready':model_ready()}); return
             if p=='/api/model/status': send_json(self,{'ok':True,'ready':model_ready()}); return
+            if p=='/api/training/export-yolo': self.export_yolo(); return
             if p=='/api/training/images': send_json(self,{'ok':True,'images':training_images()}); return
             if p.startswith('/api/training/image/') and p.endswith('/detail'):
                 iid=int(p.split('/')[4])
@@ -351,6 +361,74 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self,{'ok':False,'error':'Not found'},404)
         except ValueError as e: send_json(self,{'ok':False,'error':str(e)},400)
         except Exception as e: traceback.print_exc(); send_json(self,{'ok':False,'error':str(e)},500)
+
+    def export_yolo(self):
+        conn=db()
+        try:
+            c=conn.cursor(cursor_factory=RealDictCursor)
+            c.execute("SELECT id,filename,image_data FROM dataset_images ORDER BY id ASC")
+            images=[dict(x) for x in c.fetchall()]
+            if not images:
+                send_json(self,{'ok':False,'error':'No training images found.'},400); return
+            rows=[]
+            for img in images:
+                c.execute("SELECT class_name,x_center,y_center,width,height FROM annotations WHERE image_id=%s ORDER BY id",(img['id'],))
+                anns=[dict(x) for x in c.fetchall()]
+                if anns: rows.append((img,anns))
+        finally: conn.close()
+        if not rows:
+            send_json(self,{'ok':False,'error':'No labeled training images found.'},400); return
+        rng=random.Random(42); rng.shuffle(rows)
+        if len(rows)==1: train_rows,val_rows=rows,[]
+        else:
+            val_n=max(1,round(len(rows)*0.2)); val_n=min(val_n,len(rows)-1)
+            val_rows=rows[:val_n]; train_rows=rows[val_n:]
+        def safe_filename(name,iid):
+            name=os.path.basename(str(name or 'image.jpg')); root,ext=os.path.splitext(name); ext=ext.lower()
+            if ext not in ('.jpg','.jpeg','.png','.webp','.bmp'): ext='.jpg'
+            clean=''.join(ch if ch.isalnum() or ch in ('-','_') else '_' for ch in root).strip('_') or 'image'
+            return f'{iid}_{clean}{ext}'
+        def image_bytes(raw):
+            if isinstance(raw,str):
+                if raw.startswith('data:image/') and ',' in raw: raw=raw.split(',',1)[1]
+                return base64.b64decode(raw)
+            return bytes(raw)
+        def make_label(anns):
+            lines=[]
+            for a in anns:
+                cls=a.get('class_name')
+                if cls not in CLASS_IDS: continue
+                try: x,y,w,h=[float(a[k]) for k in ('x_center','y_center','width','height')]
+                except Exception: continue
+                if not (0<=x<=1 and 0<=y<=1 and 0<w<=1 and 0<h<=1): continue
+                lines.append(f"{CLASS_IDS[cls]} {x:.6f} {y:.6f} {w:.6f} {h:.6f}")
+            return '\n'.join(lines)+'\n' if lines else ''
+        mem=io.BytesIO()
+        with zipfile.ZipFile(mem,'w',compression=zipfile.ZIP_DEFLATED) as z:
+            data_yaml="""path: .
+train: images/train
+val: images/val
+nc: 4
+names:
+  0: BUCKET_LOADED
+  1: BUCKET_EMPTY
+  2: PEOPLE
+  3: EQUIPMENT
+"""
+            z.writestr('data.yaml',data_yaml)
+            z.writestr('README.txt','BUCKET COUNTER AI - YOLO DATASET\n\nClasses:\n0 BUCKET_LOADED (count)\n1 BUCKET_EMPTY (no count)\n2 PEOPLE (no count)\n3 EQUIPMENT (no count)\n')
+            manifest=[]
+            for split,items in (('train',train_rows),('val',val_rows)):
+                for img,anns in items:
+                    fname=safe_filename(img.get('filename'),img.get('id'))
+                    z.writestr(f'images/{split}/{fname}',image_bytes(img.get('image_data')))
+                    z.writestr(f'labels/{split}/{os.path.splitext(fname)[0]}.txt',make_label(anns))
+                    manifest.append({'image_id':img.get('id'),'filename':img.get('filename'),'split':split,'annotations':len(anns)})
+            z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
+        raw=mem.getvalue()
+        try:
+            self.send_response(200); self.send_header('Content-Type','application/zip'); self.send_header('Content-Length',str(len(raw))); self.send_header('Content-Disposition','attachment; filename="bucket_counter_yolo_dataset.zip"'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(raw)
+        except (BrokenPipeError,ConnectionResetError): pass
 
     def add_bucket(self,d):
         name=str(d.get('bucket_name','')).strip()
