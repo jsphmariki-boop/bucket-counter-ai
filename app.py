@@ -1,4 +1,4 @@
-import os, json, base64, traceback
+import os, json, base64, traceback, mimetypes
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import psycopg2
@@ -209,7 +209,7 @@ let reviewedId=null;
 function escapeHtml(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
 async function loadGallery(){const el=document.getElementById('gallery');try{const r=await fetch('/api/training/images');const j=await r.json();if(!j.ok){el.innerHTML='<p class="muted">'+escapeHtml(j.error)+'</p>';return}if(!j.images.length){el.innerHTML='<p class="muted">No training images yet.</p>';return}el.innerHTML=j.images.map(x=>'<div class="card" style="margin:0;border:1px solid #e2e8f0;box-shadow:none"><img src="/api/training/image/'+x.id+'" style="width:100%;height:180px;object-fit:cover;border-radius:9px"><b>'+escapeHtml(x.filename)+'</b><p class="muted">Boxes: '+x.annotation_count+' | '+escapeHtml(x.created_at||'')+'</p><div class="row"><button type="button" onclick="reviewImage('+x.id+')">🔍 REVIEW</button><button type="button" class="danger" onclick="deleteImage('+x.id+')">🗑️ DELETE</button></div></div>').join('')}catch(e){el.innerHTML='<p class="muted">Gallery error: '+escapeHtml(e.message)+'</p>'}}
 async function refreshGallery(){loadGallery()}
-async function reviewImage(id){reviewedId=id;const box=document.getElementById('reviewBox');box.classList.remove('hidden');document.getElementById('reviewMsg').textContent='Loading...';try{const r=await fetch('/api/training/image/'+id+'/detail');const j=await r.json();if(!j.ok){document.getElementById('reviewMsg').textContent=j.error;return}document.getElementById('reviewName').textContent=j.image.filename;document.getElementById('reviewImage').src='/api/training/image/'+id;document.getElementById('reviewAnnotations').innerHTML=j.annotations.map((a,i)=>'<div class="classbox"><b>'+(i+1)+'. '+escapeHtml(a.class_name)+'</b><select id="editClass'+a.id+'"><option value="BUCKET_LOADED">BUCKET_LOADED</option><option value="BUCKET_EMPTY">BUCKET_EMPTY</option><option value="PEOPLE">PEOPLE</option><option value="EQUIPMENT">EQUIPMENT</option></select><button type="button" class="green" onclick="updateAnnotation('+a.id+')">SAVE CLASS</button></div>').join('');j.annotations.forEach(a=>{document.getElementById('editClass'+a.id).value=a.class_name});document.getElementById('reviewMsg').textContent=''}catch(e){document.getElementById('reviewMsg').textContent=e.message}}
+async function reviewImage(id){reviewedId=id;const box=document.getElementById('reviewBox');box.classList.remove('hidden');box.scrollIntoView({behavior:'smooth',block:'start'});document.getElementById('reviewImage').src='';document.getElementById('reviewMsg').textContent='Loading...';try{const r=await fetch('/api/training/image/'+id+'/detail');const j=await r.json();if(!j.ok){document.getElementById('reviewMsg').textContent=j.error;return}document.getElementById('reviewName').textContent=j.image.filename;document.getElementById('reviewImage').src=j.image.image_data||('/api/training/image/'+id);document.getElementById('reviewImage').style.display='block';document.getElementById('reviewAnnotations').innerHTML=j.annotations.map((a,i)=>'<div class="classbox"><b>'+(i+1)+'. '+escapeHtml(a.class_name)+'</b><select id="editClass'+a.id+'"><option value="BUCKET_LOADED">BUCKET_LOADED</option><option value="BUCKET_EMPTY">BUCKET_EMPTY</option><option value="PEOPLE">PEOPLE</option><option value="EQUIPMENT">EQUIPMENT</option></select><button type="button" class="green" onclick="updateAnnotation('+a.id+')">SAVE CLASS</button></div>').join('');j.annotations.forEach(a=>{document.getElementById('editClass'+a.id).value=a.class_name});document.getElementById('reviewMsg').textContent=''}catch(e){document.getElementById('reviewMsg').textContent=e.message}}
 function closeReview(){document.getElementById('reviewBox').classList.add('hidden');reviewedId=null}
 async function updateAnnotation(id){const cls=document.getElementById('editClass'+id).value;const r=await fetch('/api/training/annotation/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({class_name:cls})});const j=await r.json();document.getElementById('reviewMsg').textContent=j.ok?'✅ Class updated.':(j.error||'Update failed.');if(j.ok)loadGallery()}
 async function deleteImage(id){if(!confirm('Delete this training image and all its annotations?'))return;const r=await fetch('/api/training/image/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok){alert(j.error||'Delete failed.');return}document.getElementById('reviewBox').classList.add('hidden');reviewedId=null;loadGallery();location.reload()}
@@ -285,10 +285,26 @@ class Handler(BaseHTTPRequestHandler):
                 conn=db()
                 try:
                     c=conn.cursor(cursor_factory=RealDictCursor)
-                    c.execute('SELECT id,filename,created_at,labeled FROM dataset_images WHERE id=%s',(iid,)); img=c.fetchone()
+                    c.execute('SELECT id,filename,image_data,created_at,labeled FROM dataset_images WHERE id=%s',(iid,)); img=c.fetchone()
                     if not img: send_json(self,{'ok':False,'error':'Image not found.'},404); return
                     c.execute('SELECT id,class_name,x_center,y_center,width,height FROM annotations WHERE image_id=%s ORDER BY id',(iid,)); anns=[dict(x) for x in c.fetchall()]
                     img=dict(img)
+                    raw=img.pop('image_data',None)
+                    if raw is not None:
+                        if isinstance(raw,str):
+                            if raw.startswith('data:image/'):
+                                image_data=raw
+                            else:
+                                try: image_data='data:image/jpeg;base64,'+raw
+                                except Exception: image_data=''
+                        else:
+                            b=bytes(raw)
+                            ext=str(img.get('filename','')).lower()
+                            mime='image/jpeg'
+                            if ext.endswith('.png'): mime='image/png'
+                            elif ext.endswith('.webp'): mime='image/webp'
+                            image_data='data:'+mime+';base64,'+base64.b64encode(b).decode('ascii')
+                        img['image_data']=image_data
                     if img.get('created_at'): img['created_at']=str(img['created_at'])
                     send_json(self,{'ok':True,'image':img,'annotations':anns})
                 finally: conn.close()
@@ -299,11 +315,17 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     c=conn.cursor(); c.execute('SELECT image_data,filename FROM dataset_images WHERE id=%s',(iid,)); row=c.fetchone()
                     if not row: send_json(self,{'ok':False,'error':'Image not found.'},404); return
-                    raw,filename=row; mime='image/jpeg'
-                    if str(filename).lower().endswith('.png'): mime='image/png'
-                    elif str(filename).lower().endswith('.webp'): mime='image/webp'
+                    raw,filename=row; ext=str(filename).lower(); mime='image/jpeg'
+                    if ext.endswith('.png'): mime='image/png'
+                    elif ext.endswith('.webp'): mime='image/webp'
+                    if isinstance(raw,str):
+                        if raw.startswith('data:image/') and ',' in raw:
+                            raw=base64.b64decode(raw.split(',',1)[1])
+                        else:
+                            raw=base64.b64decode(raw)
+                    raw=bytes(raw)
                     try:
-                        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(bytes(raw))
+                        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store'); self.send_header('Content-Disposition','inline'); self.end_headers(); self.wfile.write(raw)
                     except (BrokenPipeError,ConnectionResetError): pass
                 finally: conn.close()
                 return
