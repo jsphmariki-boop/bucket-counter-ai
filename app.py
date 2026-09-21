@@ -3,6 +3,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+os.environ.setdefault('YOLO_CONFIG_DIR', '/tmp/Ultralytics')
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from ultralytics import YOLO
@@ -40,32 +41,53 @@ def db():
 
 def init_db():
     c = db(); x = c.cursor()
-    x.execute('''CREATE TABLE IF NOT EXISTS buckets (
-        id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
-        active BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS dataset_images (
-        id SERIAL PRIMARY KEY, filename TEXT NOT NULL, image_data BYTEA NOT NULL,
-        mime_type TEXT DEFAULT 'image/jpeg', created_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS annotations (
-        id SERIAL PRIMARY KEY, image_id INTEGER REFERENCES dataset_images(id) ON DELETE CASCADE,
-        class_name TEXT NOT NULL, x_center DOUBLE PRECISION NOT NULL,
-        y_center DOUBLE PRECISION NOT NULL, box_width DOUBLE PRECISION NOT NULL,
-        box_height DOUBLE PRECISION NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS training_state (
-        id INTEGER PRIMARY KEY, status TEXT DEFAULT 'idle', message TEXT DEFAULT '',
-        progress INTEGER DEFAULT 0, updated_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS trained_model (
-        id INTEGER PRIMARY KEY, model_data BYTEA NOT NULL, filename TEXT DEFAULT 'best.pt',
-        created_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS daily_counts (
-        id SERIAL PRIMARY KEY, count_date DATE UNIQUE NOT NULL,
-        bucket_count INTEGER DEFAULT 0, updated_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute('''CREATE TABLE IF NOT EXISTS detection_events (
-        id SERIAL PRIMARY KEY, class_name TEXT NOT NULL,
-        confidence DOUBLE PRECISION DEFAULT 0, counted BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ DEFAULT NOW())''')
-    x.execute("INSERT INTO training_state(id,status,message,progress) VALUES(1,'idle','Ready',0) ON CONFLICT(id) DO NOTHING")
-    c.commit(); x.close(); c.close()
+    try:
+        x.execute("""CREATE TABLE IF NOT EXISTS buckets (
+            id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
+            active BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS dataset_images (
+            id SERIAL PRIMARY KEY, filename TEXT NOT NULL, image_data BYTEA NOT NULL,
+            mime_type TEXT DEFAULT 'image/jpeg', created_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS annotations (
+            id SERIAL PRIMARY KEY, image_id INTEGER REFERENCES dataset_images(id) ON DELETE CASCADE,
+            class_name TEXT NOT NULL, x_center DOUBLE PRECISION NOT NULL,
+            y_center DOUBLE PRECISION NOT NULL, box_width DOUBLE PRECISION NOT NULL,
+            box_height DOUBLE PRECISION NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS training_state (
+            id INTEGER PRIMARY KEY, status TEXT DEFAULT 'idle', message TEXT DEFAULT '',
+            progress INTEGER DEFAULT 0, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS trained_model (
+            id INTEGER PRIMARY KEY, model_data BYTEA NOT NULL, filename TEXT DEFAULT 'best.pt',
+            created_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS daily_counts (
+            id SERIAL PRIMARY KEY, count_date DATE UNIQUE NOT NULL,
+            bucket_count INTEGER DEFAULT 0, updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("""CREATE TABLE IF NOT EXISTS detection_events (
+            id SERIAL PRIMARY KEY, class_name TEXT NOT NULL,
+            confidence DOUBLE PRECISION DEFAULT 0, counted BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW())""")
+        x.execute("ALTER TABLE dataset_images ADD COLUMN IF NOT EXISTS mime_type TEXT DEFAULT 'image/jpeg'")
+        x.execute("ALTER TABLE dataset_images ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()")
+        x.execute("ALTER TABLE daily_counts ADD COLUMN IF NOT EXISTS bucket_count INTEGER DEFAULT 0")
+        x.execute("ALTER TABLE daily_counts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
+        x.execute("ALTER TABLE training_state ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'idle'")
+        x.execute("ALTER TABLE training_state ADD COLUMN IF NOT EXISTS message TEXT DEFAULT ''")
+        x.execute("ALTER TABLE training_state ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0")
+        x.execute("ALTER TABLE training_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
+        x.execute("ALTER TABLE trained_model ADD COLUMN IF NOT EXISTS model_data BYTEA")
+        x.execute("ALTER TABLE trained_model ADD COLUMN IF NOT EXISTS filename TEXT DEFAULT 'best.pt'")
+        x.execute("ALTER TABLE trained_model ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()")
+        x.execute("UPDATE dataset_images SET mime_type='image/jpeg' WHERE mime_type IS NULL")
+        x.execute("UPDATE daily_counts SET bucket_count=0 WHERE bucket_count IS NULL")
+        x.execute("UPDATE training_state SET status='idle' WHERE status IS NULL")
+        x.execute("UPDATE training_state SET message='' WHERE message IS NULL")
+        x.execute("UPDATE training_state SET progress=0 WHERE progress IS NULL")
+        x.execute("INSERT INTO training_state(id,status,message,progress) VALUES(1,'idle','Ready',0) ON CONFLICT(id) DO NOTHING")
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally:
+        x.close(); c.close()
 
 
 def esc(v):
@@ -153,11 +175,30 @@ def count_loaded(dets):
     if not loaded:return {'counted':False,'reason':'No loaded bucket detected.','count':0}
     if time.time()-LAST_COUNT_TIME < COUNT_COOLDOWN_SECONDS:return {'counted':False,'reason':'Cooldown: possible same bucket.','count':0}
     best=max(loaded,key=lambda d:d['confidence']); conf=float(best['confidence'])
-    c=db(); x=c.cursor(); x.execute('''INSERT INTO daily_counts(count_date,bucket_count,updated_at) VALUES(CURRENT_DATE,1,NOW()) ON CONFLICT(count_date) DO UPDATE SET bucket_count=daily_counts.bucket_count+1,updated_at=NOW()'''); x.execute('INSERT INTO detection_events(class_name,confidence,counted) VALUES(%s,%s,TRUE)',('BUCKET_LOADED',conf)); c.commit(); x.close(); c.close(); LAST_COUNT_TIME=time.time(); return {'counted':True,'reason':'Loaded bucket counted.','count':1,'confidence':conf}
+    c=db(); x=c.cursor()
+    try:
+        x.execute("SELECT id FROM daily_counts WHERE count_date::text = CURRENT_DATE::text LIMIT 1")
+        existing=x.fetchone()
+        if existing:
+            x.execute('UPDATE daily_counts SET bucket_count=COALESCE(bucket_count,0)+1, updated_at=NOW() WHERE id=%s',(existing['id'],))
+        else:
+            x.execute('INSERT INTO daily_counts(count_date,bucket_count,updated_at) VALUES(CURRENT_DATE,1,NOW())')
+        x.execute('INSERT INTO detection_events(class_name,confidence,counted) VALUES(%s,%s,TRUE)',('BUCKET_LOADED',conf))
+        c.commit()
+    finally:
+        x.close(); c.close()
+    LAST_COUNT_TIME=time.time()
+    return {'counted':True,'reason':'Loaded bucket counted.','count':1,'confidence':conf}
 
 
 def today():
-    c=db(); x=c.cursor(); x.execute('SELECT bucket_count FROM daily_counts WHERE count_date=CURRENT_DATE'); r=x.fetchone(); x.close(); c.close(); return int(r['bucket_count']) if r else 0
+    c = db(); x = c.cursor()
+    try:
+        x.execute("SELECT bucket_count FROM daily_counts WHERE count_date::text = CURRENT_DATE::text LIMIT 1")
+        r = x.fetchone()
+        return int(r['bucket_count']) if r else 0
+    finally:
+        x.close(); c.close()
 
 
 def dataset_rows():
@@ -183,71 +224,88 @@ def set_training(status,msg,progress):
     c=db(); x=c.cursor(); x.execute('UPDATE training_state SET status=%s,message=%s,progress=%s,updated_at=NOW() WHERE id=1',(status,msg,int(progress))); c.commit(); x.close(); c.close()
 
 
+def _image_bytes(value):
+    if value is None:return b''
+    if isinstance(value,bytes):return value
+    if isinstance(value,memoryview):return value.tobytes()
+    if isinstance(value,bytearray):return bytes(value)
+    if isinstance(value,str):
+        q=value.strip()
+        if q.startswith('\\x'):
+            try:return bytes.fromhex(q[2:])
+            except Exception:pass
+        try:return base64.b64decode(q,validate=True)
+        except Exception:return q.encode('utf-8')
+    try:return bytes(value)
+    except Exception:return b''
+
+
 def build_dataset():
     rows=dataset_rows()
-    if len(rows)<2: raise RuntimeError('Training inahitaji angalau picha 2.')
-    root=tempfile.mkdtemp(prefix='neerika_train_'); imgs=os.path.join(root,'images'); labs=os.path.join(root,'labels'); os.makedirs(imgs); os.makedirs(labs)
-    c=db(); x=c.cursor(); usable=0
+    if len(rows)<2:raise RuntimeError('Training inahitaji angalau picha 2.')
+    root=tempfile.mkdtemp(prefix='neerika_train_'); imgs=os.path.join(root,'images'); labs=os.path.join(root,'labels')
+    os.makedirs(imgs,exist_ok=True); os.makedirs(labs,exist_ok=True); usable=0
+    c=db(); x=c.cursor()
     try:
         for r in rows:
-            x.execute('SELECT image_data FROM dataset_images WHERE id=%s',(r['id'],)); ir=x.fetchone()
-            x.execute('SELECT class_name,x_center,y_center,box_width,box_height FROM annotations WHERE image_id=%s ORDER BY id',(r['id'],)); anns=[a for a in x.fetchall() if a['class_name']=='BUCKET_LOADED']
-            if not ir or not anns: continue
-
-            raw=ir['image_data']
-            if raw is None: continue
-            if isinstance(raw, bytes):
-                image_bytes=raw
-            elif isinstance(raw, memoryview):
-                image_bytes=raw.tobytes()
-            elif isinstance(raw, bytearray):
-                image_bytes=bytes(raw)
-            elif isinstance(raw, str):
-                value=raw.strip()
-                if value.startswith('data:image/') and ',' in value:
-                    try: image_bytes=base64.b64decode(value.split(',',1)[1])
-                    except Exception: image_bytes=value.encode('utf-8')
-                elif value.startswith('\\x'):
-                    try: image_bytes=bytes.fromhex(value[2:])
-                    except Exception: image_bytes=value.encode('utf-8')
-                else:
-                    try: image_bytes=base64.b64decode(value,validate=True)
-                    except Exception: image_bytes=value.encode('utf-8')
-            else:
-                image_bytes=bytes(raw)
-
-            ext=os.path.splitext(r['filename'])[1].lower()
-            if ext not in ['.jpg','.jpeg','.png','.webp']: ext='.jpg'
+            x.execute('SELECT image_data,mime_type,filename FROM dataset_images WHERE id=%s',(r['id'],)); ir=x.fetchone()
+            if not ir:continue
+            x.execute('SELECT class_name,x_center,y_center,box_width,box_height FROM annotations WHERE image_id=%s ORDER BY id',(r['id'],))
+            anns=[a for a in x.fetchall() if str(a.get('class_name') or '').upper()=='BUCKET_LOADED']
+            if not anns:continue
+            raw=_image_bytes(ir.get('image_data'))
+            if not raw:print('Skipping image',r['id'],'- invalid image_data');continue
+            filename=str(ir.get('filename') or r.get('filename') or '').lower(); mime=str(ir.get('mime_type') or '').lower()
+            ext='.png' if ('png' in mime or filename.endswith('.png')) else ('.webp' if ('webp' in mime or filename.endswith('.webp')) else '.jpg')
             stem='image_'+str(r['id'])
-            with open(os.path.join(imgs,stem+ext),'wb') as f: f.write(image_bytes)
-            with open(os.path.join(labs,stem+'.txt'),'w',encoding='utf-8') as f:
+            with open(os.path.join(imgs,stem+ext),'wb') as f:f.write(raw)
+            label_path=os.path.join(labs,stem+'.txt')
+            with open(label_path,'w',encoding='utf-8') as f:
                 for a in anns:
-                    f.write('0 '+f"{float(a['x_center']):.6f} {float(a['y_center']):.6f} {float(a['box_width']):.6f} {float(a['box_height']):.6f}\n")
-            usable+=1
-    finally:
-        x.close(); c.close()
-    if usable<2: shutil.rmtree(root,ignore_errors=True); raise RuntimeError('Angalau picha 2 zenye BUCKET_LOADED annotations zinahitajika.')
-    yaml=os.path.join(root,'data.yaml'); open(yaml,'w',encoding='utf-8').write('path: '+root.replace('\\','/')+'\ntrain: images\nval: images\nnames:\n  0: loaded_bucket\n'); return root,yaml,usable
+                    try:
+                        xc=max(0,min(1,float(a['x_center']))); yc=max(0,min(1,float(a['y_center']))); bw=max(0,min(1,float(a['box_width']))); bh=max(0,min(1,float(a['box_height'])))
+                        f.write(f'0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n')
+                    except Exception:pass
+            if os.path.getsize(label_path)>0:usable+=1
+    finally:x.close();c.close()
+    if usable<2:
+        shutil.rmtree(root,ignore_errors=True);raise RuntimeError('Angalau picha 2 zenye BUCKET_LOADED annotations zinahitajika.')
+    yaml=os.path.join(root,'data.yaml')
+    with open(yaml,'w',encoding='utf-8') as f:f.write('path: '+root.replace('\\','/')+'\ntrain: images\nval: images\nnames:\n  0: BUCKET_LOADED\n')
+    return root,yaml,usable
 
 
 def training_worker():
-    global TRAINING,MODEL
+    global TRAINING, MODEL, MODEL_ERROR
     with TRAIN_LOCK:
         if TRAINING:return
         TRAINING=True
     root=None
     try:
-        set_training('preparing','Preparing dataset...',5); root,yaml,usable=build_dataset(); set_training('training',f'Dataset ready: {usable} images. Training started...',10)
-        m=YOLO('yolo11n.pt'); out=os.path.join(root,'runs'); os.makedirs(out,exist_ok=True); set_training('training',f'Training YOLO for {TRAIN_EPOCHS} epochs...',15)
-        m.train(data=yaml,epochs=TRAIN_EPOCHS,imgsz=YOLO_IMAGE_SIZE,project=out,name='neerika_bucket',exist_ok=True,verbose=False)
+        set_training('preparing','Preparing dataset...',5)
+        root,yaml,usable=build_dataset()
+        set_training('training',f'Dataset ready: {usable} images. Starting YOLO {TRAIN_EPOCHS} epochs...',18)
+        model=YOLO('yolo11n.pt'); out=os.path.join(root,'runs'); os.makedirs(out,exist_ok=True)
+        def on_epoch_end(trainer):
+            try:
+                epoch=int(getattr(trainer,'epoch',0))+1; total=max(1,int(getattr(trainer,'epochs',TRAIN_EPOCHS) or TRAIN_EPOCHS)); progress=min(90,20+int((epoch/total)*70))
+                set_training('training',f'Training epoch {epoch}/{total}...',progress); print(f'NEERIKA TRAINING: epoch {epoch}/{total} -> {progress}%')
+            except Exception:traceback.print_exc()
+        model.add_callback('on_train_epoch_end',on_epoch_end)
+        set_training('training',f'Training YOLO for {TRAIN_EPOCHS} epochs... Epoch 0/{TRAIN_EPOCHS}',20)
+        print(f'NEERIKA TRAINING START: {TRAIN_EPOCHS} epochs, workers=0, batch=4')
+        model.train(data=yaml,epochs=TRAIN_EPOCHS,imgsz=YOLO_IMAGE_SIZE,project=out,name='neerika_bucket',exist_ok=True,verbose=True,workers=0,batch=4,cache=False)
         best=os.path.join(out,'neerika_bucket','weights','best.pt')
         if not os.path.exists(best):raise RuntimeError('Training imekwisha lakini best.pt haikupatikana.')
-        shutil.copy2(best,MODEL_PATH); os.makedirs(os.path.dirname(MODEL_BACKUP_PATH),exist_ok=True); shutil.copy2(best,MODEL_BACKUP_PATH); set_training('saving','Saving trained model to database...',90); save_model_db(MODEL_PATH)
-        with MODEL_LOCK: MODEL=YOLO(MODEL_PATH)
-        set_training('completed','Training completed successfully.',100)
+        set_training('saving','Training complete. Saving best.pt...',93)
+        shutil.copy2(best,MODEL_PATH); os.makedirs(os.path.dirname(MODEL_BACKUP_PATH),exist_ok=True); shutil.copy2(best,MODEL_BACKUP_PATH)
+        set_training('saving','Saving trained model to Supabase...',96); save_model_db(MODEL_PATH)
+        with MODEL_LOCK:MODEL=YOLO(MODEL_PATH); MODEL_ERROR=''
+        set_training('completed',f'Training completed successfully. {usable} images, {TRAIN_EPOCHS} epochs.',100)
+        print('NEERIKA TRAINING COMPLETE: best.pt saved to database.')
     except Exception as e:
-        traceback.print_exc();
-        try:set_training('error',str(e),0)
+        traceback.print_exc()
+        try:set_training('error','Training error: '+str(e),0)
         except Exception:pass
     finally:
         if root:shutil.rmtree(root,ignore_errors=True)
@@ -292,6 +350,9 @@ class Handler(BaseHTTPRequestHandler):
         n=int(self.headers.get('Content-Length','0'))
         if n>MAX_JSON_BYTES:raise ValueError('Request too large.')
         return json.loads(self.rfile.read(n).decode()) if n else {}
+    def do_HEAD(self):
+        self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.end_headers()
+
     def do_GET(self):
         try:
             p=urlparse(self.path).path
@@ -305,11 +366,11 @@ class Handler(BaseHTTPRequestHandler):
             if p=='/api/history':
                 c=db();x=c.cursor();x.execute('SELECT count_date,bucket_count,updated_at FROM daily_counts ORDER BY count_date DESC LIMIT 100');r=x.fetchall();x.close();c.close();return json_out(self,{'history':r,'today_count':today()})
             if p=='/api/history.csv':
-                c=db();x=c.cursor();x.execute('SELECT count_date,bucket_count,updated_at FROM daily_counts ORDER BY count_date DESC');r=x.fetchall();x.close();c.close();o=io.StringIO();w=csv.writer(o);w.writerow(['Date','Loaded Buckets','Updated At']);[w.writerow([z['count_date'],z['bucket_count'],z['updated_at']]) for z in r];return html_out(self,o.getvalue(),200)
+                c=db();x=c.cursor();x.execute('SELECT count_date,bucket_count,updated_at FROM daily_counts ORDER BY count_date DESC');r=x.fetchall();x.close();c.close();o=io.StringIO();w=csv.writer(o);w.writerow(['Date','Loaded Buckets','Updated At']);[w.writerow([z['count_date'],z['bucket_count'],z['updated_at']]) for z in r];b=o.getvalue().encode();self.send_response(200);self.send_header('Content-Type','text/csv; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.send_header('Content-Disposition','attachment; filename=neerika_history.csv');self.end_headers();self.wfile.write(b);return
             if p.startswith('/api/dataset/image/'):
                 i=int(p.rsplit('/',1)[1]);c=db();x=c.cursor();x.execute('SELECT image_data,mime_type FROM dataset_images WHERE id=%s',(i,));r=x.fetchone();x.close();c.close();
                 if not r:return error_out(self,'Image not found.',404)
-                b=bytes(r['image_data']);self.send_response(200);self.send_header('Content-Type',r['mime_type'] or 'image/jpeg');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
+                b=_image_bytes(r['image_data']);self.send_response(200);self.send_header('Content-Type',r['mime_type'] or 'image/jpeg');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
             return error_out(self,'Not found.',404)
         except Exception as e:traceback.print_exc();return error_out(self,e,500)
     def do_POST(self):
@@ -328,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(b)>MAX_UPLOAD_BYTES:raise ValueError('Image too large.')
                 i=save_image(str(d.get('filename','image.jpg')),str(d.get('mime_type','image/jpeg')),b);return json_out(self,{'message':'Image uploaded successfully.','id':i})
             if p=='/api/dataset/delete':
-                i=int(self.body_json()['id']);return json_out(self,{'message':'Image deleted successfully.'} if delete_image(i) else {'error':'Image not found.'},200 if delete_image(i) else 404)
+                i=int(self.body_json()['id']); ok=delete_image(i); return json_out(self,{'message':'Image deleted successfully.'} if ok else {'error':'Image not found.'},200 if ok else 404)
             if p=='/api/dataset/annotations':
                 d=self.body_json();save_annotations(int(d['image_id']),d.get('annotations',[]));return json_out(self,{'message':'Annotations saved successfully.'})
             if p=='/api/training/start':
