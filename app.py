@@ -190,17 +190,44 @@ def build_dataset():
     c=db(); x=c.cursor(); usable=0
     try:
         for r in rows:
-            x.execute('SELECT image_data FROM dataset_images WHERE id=%s',(r['id'],)); ir=x.fetchone(); x.execute('SELECT class_name,x_center,y_center,box_width,box_height FROM annotations WHERE image_id=%s ORDER BY id',(r['id'],)); anns=[a for a in x.fetchall() if a['class_name']=='BUCKET_LOADED']
+            x.execute('SELECT image_data FROM dataset_images WHERE id=%s',(r['id'],)); ir=x.fetchone()
+            x.execute('SELECT class_name,x_center,y_center,box_width,box_height FROM annotations WHERE image_id=%s ORDER BY id',(r['id'],)); anns=[a for a in x.fetchall() if a['class_name']=='BUCKET_LOADED']
             if not ir or not anns: continue
+
+            raw=ir['image_data']
+            if raw is None: continue
+            if isinstance(raw, bytes):
+                image_bytes=raw
+            elif isinstance(raw, memoryview):
+                image_bytes=raw.tobytes()
+            elif isinstance(raw, bytearray):
+                image_bytes=bytes(raw)
+            elif isinstance(raw, str):
+                value=raw.strip()
+                if value.startswith('data:image/') and ',' in value:
+                    try: image_bytes=base64.b64decode(value.split(',',1)[1])
+                    except Exception: image_bytes=value.encode('utf-8')
+                elif value.startswith('\\x'):
+                    try: image_bytes=bytes.fromhex(value[2:])
+                    except Exception: image_bytes=value.encode('utf-8')
+                else:
+                    try: image_bytes=base64.b64decode(value,validate=True)
+                    except Exception: image_bytes=value.encode('utf-8')
+            else:
+                image_bytes=bytes(raw)
+
             ext=os.path.splitext(r['filename'])[1].lower()
             if ext not in ['.jpg','.jpeg','.png','.webp']: ext='.jpg'
-            stem='image_'+str(r['id']); open(os.path.join(imgs,stem+ext),'wb').write(bytes(ir['image_data']))
-            with open(os.path.join(labs,stem+'.txt'),'w') as f:
-                for a in anns:f.write('0 '+f"{float(a['x_center']):.6f} {float(a['y_center']):.6f} {float(a['box_width']):.6f} {float(a['box_height']):.6f}\n")
+            stem='image_'+str(r['id'])
+            with open(os.path.join(imgs,stem+ext),'wb') as f: f.write(image_bytes)
+            with open(os.path.join(labs,stem+'.txt'),'w',encoding='utf-8') as f:
+                for a in anns:
+                    f.write('0 '+f"{float(a['x_center']):.6f} {float(a['y_center']):.6f} {float(a['box_width']):.6f} {float(a['box_height']):.6f}\n")
             usable+=1
-    finally:x.close();c.close()
+    finally:
+        x.close(); c.close()
     if usable<2: shutil.rmtree(root,ignore_errors=True); raise RuntimeError('Angalau picha 2 zenye BUCKET_LOADED annotations zinahitajika.')
-    yaml=os.path.join(root,'data.yaml'); open(yaml,'w').write('path: '+root.replace('\\','/')+'\ntrain: images\nval: images\nnames:\n  0: loaded_bucket\n'); return root,yaml,usable
+    yaml=os.path.join(root,'data.yaml'); open(yaml,'w',encoding='utf-8').write('path: '+root.replace('\\','/')+'\ntrain: images\nval: images\nnames:\n  0: loaded_bucket\n'); return root,yaml,usable
 
 
 def training_worker():
