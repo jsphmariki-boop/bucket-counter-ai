@@ -21,7 +21,6 @@ from ultralytics import YOLO
 from PIL import Image
 import numpy as np
 
-
 # ============================================================
 # NEERIKA BUCKET AI
 # Mining Production Bucket Counter
@@ -69,7 +68,6 @@ COUNT_COOLDOWN_SECONDS = float(
     )
 )
 
-
 # ============================================================
 # GLOBAL STATE
 # ============================================================
@@ -98,7 +96,6 @@ CLASS_IDS = {
 
 DAILY_COUNTS_DATE_TYPE = "date"
 
-
 # ============================================================
 # DATABASE
 # ============================================================
@@ -115,14 +112,11 @@ def db():
         connect_timeout=15,
     )
 
-
 def get_today_string():
     return datetime.now().strftime("%Y-%m-%d")
 
-
 def get_today_date():
     return datetime.now().date()
-
 
 def init_db():
     global DAILY_COUNTS_DATE_TYPE
@@ -131,10 +125,6 @@ def init_db():
     x = c.cursor()
 
     try:
-        # ----------------------------------------------------
-        # BUCKETS
-        # ----------------------------------------------------
-
         x.execute("""
             CREATE TABLE IF NOT EXISTS buckets (
                 id SERIAL PRIMARY KEY,
@@ -145,10 +135,6 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # DATASET IMAGES
-        # ----------------------------------------------------
-
         x.execute("""
             CREATE TABLE IF NOT EXISTS dataset_images (
                 id SERIAL PRIMARY KEY,
@@ -158,10 +144,6 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-
-        # ----------------------------------------------------
-        # ANNOTATIONS
-        # ----------------------------------------------------
 
         x.execute("""
             CREATE TABLE IF NOT EXISTS annotations (
@@ -178,10 +160,6 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # TRAINING STATE
-        # ----------------------------------------------------
-
         x.execute("""
             CREATE TABLE IF NOT EXISTS training_state (
                 id INTEGER PRIMARY KEY,
@@ -196,10 +174,6 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # TRAINED MODEL
-        # ----------------------------------------------------
-
         x.execute("""
             CREATE TABLE IF NOT EXISTS trained_model (
                 id INTEGER PRIMARY KEY,
@@ -208,10 +182,6 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-
-        # ----------------------------------------------------
-        # DAILY COUNTS
-        # ----------------------------------------------------
 
         x.execute("""
             CREATE TABLE IF NOT EXISTS daily_counts (
@@ -222,10 +192,6 @@ def init_db():
             )
         """)
 
-        # ----------------------------------------------------
-        # DETECTION EVENTS
-        # ----------------------------------------------------
-
         x.execute("""
             CREATE TABLE IF NOT EXISTS detection_events (
                 id SERIAL PRIMARY KEY,
@@ -235,10 +201,6 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-
-        # ----------------------------------------------------
-        # TRAINING DEFAULT STATE
-        # ----------------------------------------------------
 
         x.execute("""
             INSERT INTO training_state
@@ -263,24 +225,14 @@ def init_db():
         x.close()
         c.close()
 
-    # Detect existing schema after tables exist.
     try:
         DAILY_COUNTS_DATE_TYPE = get_daily_counts_column_type()
-
-        print(
-            "daily_counts.count_date type:",
-            DAILY_COUNTS_DATE_TYPE
-        )
-
     except Exception:
         DAILY_COUNTS_DATE_TYPE = "date"
-        traceback.print_exc()
-
 
 def get_daily_counts_column_type():
     c = db()
     x = c.cursor()
-
     try:
         x.execute("""
             SELECT data_type
@@ -290,110 +242,28 @@ def get_daily_counts_column_type():
               AND column_name = 'count_date'
             LIMIT 1
         """)
-
         r = x.fetchone()
-
         if not r:
             return "date"
-
-        return str(
-            r.get("data_type") or "date"
-        ).lower()
-
+        return str(r.get("data_type") or "date").lower()
     finally:
         x.close()
         c.close()
 
-
-def refresh_daily_counts_column_type():
-    global DAILY_COUNTS_DATE_TYPE
-
-    try:
-        DAILY_COUNTS_DATE_TYPE = (
-            get_daily_counts_column_type()
-        )
-    except Exception:
-        DAILY_COUNTS_DATE_TYPE = "date"
-
-    return DAILY_COUNTS_DATE_TYPE
-
-
 def daily_count_date_expression():
-    """
-    Returns a PostgreSQL expression compatible with
-    the existing count_date column.
-
-    If old database has TEXT:
-        CURRENT_DATE::text
-
-    If database has DATE:
-        CURRENT_DATE
-    """
-
-    column_type = DAILY_COUNTS_DATE_TYPE
-
-    if column_type in (
-        "text",
-        "character varying",
-        "character",
-    ):
+    if DAILY_COUNTS_DATE_TYPE in ("text", "character varying", "character"):
         return "CURRENT_DATE::text"
-
     return "CURRENT_DATE"
 
-
 def find_today_daily_count(x):
-    """
-    FIX for:
-    operator does not exist: text = date
-
-    We compare using the actual database column type.
-    """
-
     expression = daily_count_date_expression()
-
-    query = f"""
-        SELECT
-            id,
-            bucket_count,
-            count_date
-        FROM daily_counts
-        WHERE count_date = {expression}
-        LIMIT 1
-    """
-
-    x.execute(query)
-
+    x.execute(f"SELECT id, bucket_count, count_date FROM daily_counts WHERE count_date = {expression} LIMIT 1")
     return x.fetchone()
-
 
 def insert_today_daily_count(x):
-    """
-    Insert today's count using the existing column type.
-    """
-
     expression = daily_count_date_expression()
-
-    query = f"""
-        INSERT INTO daily_counts
-            (
-                count_date,
-                bucket_count,
-                updated_at
-            )
-        VALUES
-            (
-                {expression},
-                1,
-                NOW()
-            )
-        RETURNING id
-    """
-
-    x.execute(query)
-
+    x.execute(f"INSERT INTO daily_counts (count_date, bucket_count, updated_at) VALUES ({expression}, 1, NOW()) RETURNING id")
     return x.fetchone()
-
 
 # ============================================================
 # HTML / JSON HELPERS
@@ -402,87 +272,28 @@ def insert_today_daily_count(x):
 def esc(v):
     return (
         "" if v is None else str(v)
-    ).replace(
-        "&",
-        "&amp;"
-    ).replace(
-        "<",
-        "&lt;"
-    ).replace(
-        ">",
-        "&gt;"
-    ).replace(
-        '"',
-        "&quot;"
-    ).replace(
-        "'",
-        "&#039;"
-    )
-
+    ).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#039;")
 
 def json_out(h, data, status=200):
-    b = json.dumps(
-        data,
-        ensure_ascii=False,
-        default=str,
-    ).encode("utf-8")
-
+    b = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
     h.send_response(status)
-
-    h.send_header(
-        "Content-Type",
-        "application/json; charset=utf-8",
-    )
-
-    h.send_header(
-        "Content-Length",
-        str(len(b)),
-    )
-
-    h.send_header(
-        "Cache-Control",
-        "no-store",
-    )
-
+    h.send_header("Content-Type", "application/json; charset=utf-8")
+    h.send_header("Content-Length", str(len(b)))
+    h.send_header("Cache-Control", "no-store")
     h.end_headers()
-
     h.wfile.write(b)
-
 
 def html_out(h, text, status=200):
     b = text.encode("utf-8")
-
     h.send_response(status)
-
-    h.send_header(
-        "Content-Type",
-        "text/html; charset=utf-8",
-    )
-
-    h.send_header(
-        "Content-Length",
-        str(len(b)),
-    )
-
-    h.send_header(
-        "Cache-Control",
-        "no-store",
-    )
-
+    h.send_header("Content-Type", "text/html; charset=utf-8")
+    h.send_header("Content-Length", str(len(b)))
+    h.send_header("Cache-Control", "no-store")
     h.end_headers()
-
     h.wfile.write(b)
 
-
 def error_out(h, msg, status=500):
-    return json_out(
-        h,
-        {
-            "error": str(msg)
-        },
-        status,
-    )
-
+    return json_out(h, {"error": str(msg)}, status)
 
 # ============================================================
 # PAGE LAYOUT
@@ -513,258 +324,49 @@ def layout(title, body, active):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__ - NEERIKA BUCKET AI</title>
-
 <style>
-
-*{
-    box-sizing:border-box
-}
-
-body{
-    margin:0;
-    font-family:Arial,sans-serif;
-    background:#f4f6f8;
-    color:#17202a
-}
-
-header{
-    background:#111827;
-    color:#fff;
-    padding:16px
-}
-
-.brand{
-    font-size:22px;
-    font-weight:800
-}
-
-.sub{
-    font-size:13px;
-    opacity:.75;
-    margin-top:4px
-}
-
-.nav{
-    display:flex;
-    gap:7px;
-    overflow:auto;
-    background:#1f2937;
-    padding:8px
-}
-
-.nav-item{
-    color:#fff;
-    text-decoration:none;
-    padding:10px 13px;
-    border-radius:8px;
-    white-space:nowrap
-}
-
-.nav-item.active,
-.nav-item:hover{
-    background:#374151
-}
-
-main{
-    max-width:1200px;
-    margin:auto;
-    padding:16px
-}
-
-.card,
-.stat{
-    background:#fff;
-    border-radius:14px;
-    padding:18px;
-    margin-bottom:16px;
-    box-shadow:0 2px 10px rgba(0,0,0,.07)
-}
-
-.grid{
-    display:grid;
-    grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(210px,1fr)
-        );
-    gap:14px
-}
-
-.num{
-    font-size:38px;
-    font-weight:800;
-    margin-top:7px
-}
-
-button{
-    border:0;
-    border-radius:9px;
-    padding:10px 15px;
-    background:#111827;
-    color:#fff;
-    cursor:pointer;
-    margin:3px
-}
-
-button.secondary{
-    background:#6b7280
-}
-
-button.success{
-    background:#166534
-}
-
-button.danger{
-    background:#991b1b
-}
-
-button:disabled{
-    opacity:.55;
-    cursor:not-allowed
-}
-
-input,
-select{
-    width:100%;
-    padding:10px;
-    border:1px solid #d1d5db;
-    border-radius:8px
-}
-
-label{
-    font-weight:700;
-    display:block;
-    margin-bottom:5px
-}
-
-.row{
-    margin-bottom:13px
-}
-
-.status{
-    padding:10px;
-    background:#f3f4f6;
-    border-radius:8px;
-    margin-top:10px
-}
-
-table{
-    width:100%;
-    border-collapse:collapse
-}
-
-th,
-td{
-    text-align:left;
-    padding:9px;
-    border-bottom:1px solid #e5e7eb
-}
-
-.footer{
-    text-align:center;
-    color:#6b7280;
-    font-size:12px;
-    padding:25px
-}
-
-.progress{
-    height:24px;
-    background:#e5e7eb;
-    border-radius:12px;
-    overflow:hidden
-}
-
-.bar{
-    height:100%;
-    background:#111827;
-    width:0%;
-    transition:width .3s;
-    text-align:center;
-    color:#fff;
-    font-size:12px;
-    line-height:24px
-}
-
-.preview{
-    max-width:100%;
-    max-height:500px;
-    border-radius:10px
-}
-
-.small{
-    font-size:13px;
-    color:#6b7280
-}
-
-.epoch{
-    font-size:28px;
-    font-weight:800;
-    margin:8px 0
-}
-
-@media(max-width:600px){
-
-    main{
-        padding:10px
-    }
-
-    .num{
-        font-size:30px
-    }
-
-    table{
-        font-size:13px
-    }
-
-}
-
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#f4f6f8;color:#17202a}
+header{background:#111827;color:#fff;padding:16px}
+.brand{font-size:22px;font-weight:800}
+.sub{font-size:13px;opacity:.75;margin-top:4px}
+.nav{display:flex;gap:7px;overflow:auto;background:#1f2937;padding:8px}
+.nav-item{color:#fff;text-decoration:none;padding:10px 13px;border-radius:8px;white-space:nowrap}
+.nav-item.active,.nav-item:hover{background:#374151}
+main{max-width:1200px;margin:auto;padding:16px}
+.card,.stat{background:#fff;border-radius:14px;padding:18px;margin-bottom:16px;box-shadow:0 2px 10px rgba(0,0,0,.07)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+.num{font-size:38px;font-weight:800;margin-top:7px}
+button{border:0;border-radius:9px;padding:10px 15px;background:#111827;color:#fff;cursor:pointer;margin:3px}
+button.secondary{background:#6b7280}
+button.success{background:#166534}
+button.danger{background:#991b1b}
+button:disabled{opacity:.55;cursor:not-allowed}
+input,select{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px}
+label{font-weight:700;display:block;margin-bottom:5px}
+.row{margin-bottom:13px}
+.status{padding:10px;background:#f3f4f6;border-radius:8px;margin-top:10px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:9px;border-bottom:1px solid #e5e7eb}
+.footer{text-align:center;color:#6b7280;font-size:12px;padding:25px}
+.progress{height:24px;background:#e5e7eb;border-radius:12px;overflow:hidden}
+.bar{height:100%;background:#111827;width:0%;transition:width .3s;text-align:center;color:#fff;font-size:12px;line-height:24px}
+.epoch{font-size:28px;font-weight:800;margin:8px 0}
+@media(max-width:600px){main{padding:10px}.num{font-size:30px}table{font-size:13px}}
 </style>
 </head>
-
 <body>
-
 <header>
-<div class="brand">
-NEERIKA BUCKET AI
-</div>
-
-<div class="sub">
-Mining Production Bucket Counter
-</div>
+<div class="brand">NEERIKA BUCKET AI</div>
+<div class="sub">Mining Production Bucket Counter</div>
 </header>
-
-<nav class="nav">
-__NAV__
-</nav>
-
-<main>
-__BODY__
-</main>
-
-<div class="footer">
-Geology &amp; Mining Services
-</div>
-
+<nav class="nav">__NAV__</nav>
+<main>__BODY__</main>
+<div class="footer">Geology &amp; Mining Services</div>
 </body>
 </html>
 """
-
-    return (
-        page
-        .replace(
-            "__TITLE__",
-            esc(title)
-        )
-        .replace(
-            "__NAV__",
-            nav
-        )
-        .replace(
-            "__BODY__",
-            body
-        )
-    )
-
+    return page.replace("__TITLE__", esc(title)).replace("__NAV__", nav).replace("__BODY__", body)
 
 # ============================================================
 # IMAGE HELPERS
@@ -773,38 +375,27 @@ Geology &amp; Mining Services
 def _image_bytes(value):
     if value is None:
         return b""
-
     if isinstance(value, bytes):
         return value
-
     if isinstance(value, memoryview):
         return value.tobytes()
-
     if isinstance(value, bytearray):
         return bytes(value)
-
     if isinstance(value, str):
         q = value.strip()
-
         if q.startswith("\\x"):
             try:
                 return bytes.fromhex(q[2:])
             except Exception:
                 pass
-
         try:
-            return base64.b64decode(
-                q,
-                validate=True,
-            )
+            return base64.b64decode(q, validate=True)
         except Exception:
             return q.encode("utf-8")
-
     try:
         return bytes(value)
     except Exception:
         return b""
-
 
 # ============================================================
 # MODEL
@@ -813,3863 +404,848 @@ def _image_bytes(value):
 def restore_model():
     if os.path.exists(MODEL_PATH):
         return True
-
     try:
         c = db()
         x = c.cursor()
-
         try:
-            x.execute("""
-                SELECT model_data
-                FROM trained_model
-                WHERE id=1
-            """)
-
+            x.execute("SELECT model_data FROM trained_model WHERE id=1")
             r = x.fetchone()
-
         finally:
             x.close()
             c.close()
 
         if r and r["model_data"]:
-            os.makedirs(
-                os.path.dirname(MODEL_PATH),
-                exist_ok=True,
-            )
-
-            with open(
-                MODEL_PATH,
-                "wb",
-            ) as f:
-                f.write(
-                    _image_bytes(
-                        r["model_data"]
-                    )
-                )
-
+            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+            with open(MODEL_PATH, "wb") as f:
+                f.write(_image_bytes(r["model_data"]))
             return True
-
     except Exception:
         traceback.print_exc()
-
     return False
 
-
 def load_model():
-    global MODEL
-    global MODEL_ERROR
-
+    global MODEL, MODEL_ERROR
     with MODEL_LOCK:
-
         if MODEL is not None:
             return MODEL
-
         try:
             restore_model()
-
             if os.path.exists(MODEL_PATH):
                 p = MODEL_PATH
-
             elif os.path.exists(MODEL_BACKUP_PATH):
                 p = MODEL_BACKUP_PATH
-
             else:
                 p = None
 
             if p:
                 MODEL = YOLO(p)
-
                 MODEL_ERROR = ""
-
-                print(
-                    "Loaded model:",
-                    p
-                )
-
                 return MODEL
 
             MODEL = YOLO("yolo11n.pt")
-
-            MODEL_ERROR = (
-                "Fallback yolo11n.pt loaded. "
-                "Start training your bucket model."
-            )
-
+            MODEL_ERROR = "Fallback yolo11n.pt loaded."
             return MODEL
-
         except Exception as e:
             MODEL_ERROR = str(e)
-
-            traceback.print_exc()
-
             return None
 
-
 def save_model_db(path):
-    with open(
-        path,
-        "rb",
-    ) as f:
+    with open(path, "rb") as f:
         b = f.read()
-
     c = db()
     x = c.cursor()
-
     try:
         x.execute(
-            """
-            INSERT INTO trained_model
-                (
-                    id,
-                    model_data,
-                    filename
-                )
-            VALUES
-                (
-                    1,
-                    %s,
-                    %s
-                )
-            ON CONFLICT(id)
-            DO UPDATE SET
-                model_data=EXCLUDED.model_data,
-                filename=EXCLUDED.filename,
-                created_at=NOW()
-            """,
-            (
-                psycopg2.Binary(b),
-                "best.pt",
-            ),
+            "INSERT INTO trained_model (id, model_data, filename) VALUES (1, %s, 'best.pt') ON CONFLICT(id) DO UPDATE SET model_data=EXCLUDED.model_data, created_at=NOW()",
+            (psycopg2.Binary(b),)
         )
-
         c.commit()
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
 
-
-# ============================================================
-# CLASS NORMALIZATION
-# ============================================================
-
 def normalize(cid, name=""):
     if cid in CLASS_IDS:
         return CLASS_IDS[cid]
-
     s = str(name).upper()
-
     if "EMPTY" in s:
         return "BUCKET_EMPTY"
-
-    if (
-        "PEOPLE" in s
-        or "PERSON" in s
-    ):
+    if "PEOPLE" in s or "PERSON" in s:
         return "PEOPLE"
-
-    if (
-        "EQUIPMENT" in s
-        or "MACHINE" in s
-    ):
+    if "EQUIPMENT" in s:
         return "EQUIPMENT"
-
-    if (
-        "LOADED" in s
-        or "BUCKET" in s
-    ):
-        return "BUCKET_LOADED"
-
-    return "UNKNOWN"
-
-
-# ============================================================
-# YOLO DETECTION
-# ============================================================
+    return "BUCKET_LOADED"
 
 def detect(data):
     model = load_model()
-
     if model is None:
-        raise RuntimeError(
-            "YOLO model haijapatikana: "
-            + MODEL_ERROR
-        )
-
-    im = Image.open(
-        io.BytesIO(data)
-    ).convert("RGB")
-
+        raise RuntimeError("YOLO model haijapatikana: " + MODEL_ERROR)
+    im = Image.open(io.BytesIO(data)).convert("RGB")
     arr = np.array(im)
-
-    results = model.predict(
-        source=arr,
-        conf=YOLO_CONFIDENCE,
-        imgsz=YOLO_IMAGE_SIZE,
-        verbose=False,
-    )
-
+    results = model.predict(source=arr, conf=YOLO_CONFIDENCE, imgsz=YOLO_IMAGE_SIZE, verbose=False)
     out = []
-
-    if (
-        not results
-        or results[0].boxes is None
-    ):
+    if not results or results[0].boxes is None:
         return out
-
-    names = getattr(
-        results[0],
-        "names",
-        {},
-    )
-
+    names = getattr(results[0], "names", {})
     for box in results[0].boxes:
         try:
-            xy = (
-                box.xyxy[0]
-                .cpu()
-                .numpy()
-                .tolist()
-            )
-
-            conf = float(
-                box.conf[0]
-                .cpu()
-                .item()
-            )
-
-            cid = int(
-                box.cls[0]
-                .cpu()
-                .item()
-            )
-
-            raw = names.get(
-                cid,
-                "",
-            )
-
-            out.append(
-                {
-                    "class_id": cid,
-                    "class_name": normalize(
-                        cid,
-                        raw,
-                    ),
-                    "raw_class_name": str(raw),
-                    "confidence": round(
-                        conf,
-                        4,
-                    ),
-                    "x1": round(
-                        float(xy[0]),
-                        2,
-                    ),
-                    "y1": round(
-                        float(xy[1]),
-                        2,
-                    ),
-                    "x2": round(
-                        float(xy[2]),
-                        2,
-                    ),
-                    "y2": round(
-                        float(xy[3]),
-                        2,
-                    ),
-                }
-            )
-
+            xy = box.xyxy[0].cpu().numpy().tolist()
+            conf = float(box.conf[0].cpu().item())
+            cid = int(box.cls[0].cpu().item())
+            raw = names.get(cid, "")
+            out.append({
+                "class_id": cid,
+                "class_name": normalize(cid, raw),
+                "confidence": round(conf, 4),
+                "x1": round(float(xy[0]), 2),
+                "y1": round(float(xy[1]), 2),
+                "x2": round(float(xy[2]), 2),
+                "y2": round(float(xy[3]), 2),
+            })
         except Exception:
             pass
-
     return out
-
-
-# ============================================================
-# COUNT LOADED BUCKET
-# ============================================================
 
 def count_loaded(dets):
     global LAST_COUNT_TIME
-
-    loaded = [
-        d
-        for d in dets
-        if d["class_name"] == "BUCKET_LOADED"
-    ]
-
+    loaded = [d for d in dets if d["class_name"] == "BUCKET_LOADED"]
     if not loaded:
-        return {
-            "counted": False,
-            "reason": "No loaded bucket detected.",
-            "count": 0,
-        }
+        return {"counted": False, "reason": "No loaded bucket detected.", "count": 0}
+    if time.time() - LAST_COUNT_TIME < COUNT_COOLDOWN_SECONDS:
+        return {"counted": False, "reason": "Cooldown active.", "count": 0}
 
-    if (
-        time.time() - LAST_COUNT_TIME
-        < COUNT_COOLDOWN_SECONDS
-    ):
-        return {
-            "counted": False,
-            "reason": "Cooldown: possible same bucket.",
-            "count": 0,
-        }
-
-    best = max(
-        loaded,
-        key=lambda d: d["confidence"],
-    )
-
-    conf = float(
-        best["confidence"]
-    )
+    best = max(loaded, key=lambda d: d["confidence"])
+    conf = float(best["confidence"])
 
     c = db()
     x = c.cursor()
-
     try:
         existing = find_today_daily_count(x)
-
         if existing:
-            x.execute(
-                """
-                UPDATE daily_counts
-                SET
-                    bucket_count =
-                        COALESCE(
-                            bucket_count,
-                            0
-                        ) + 1,
-                    updated_at = NOW()
-                WHERE id=%s
-                """,
-                (
-                    existing["id"],
-                ),
-            )
-
+            x.execute("UPDATE daily_counts SET bucket_count = COALESCE(bucket_count, 0) + 1, updated_at = NOW() WHERE id=%s", (existing["id"],))
         else:
             insert_today_daily_count(x)
-
-        x.execute(
-            """
-            INSERT INTO detection_events
-                (
-                    class_name,
-                    confidence,
-                    counted
-                )
-            VALUES
-                (
-                    %s,
-                    %s,
-                    TRUE
-                )
-            """,
-            (
-                "BUCKET_LOADED",
-                conf,
-            ),
-        )
-
+        x.execute("INSERT INTO detection_events (class_name, confidence, counted) VALUES (%s, %s, TRUE)", ("BUCKET_LOADED", conf))
         c.commit()
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
 
     LAST_COUNT_TIME = time.time()
-
-    return {
-        "counted": True,
-        "reason": "Loaded bucket counted.",
-        "count": 1,
-        "confidence": conf,
-    }
-
-
-# ============================================================
-# TODAY COUNT
-# ============================================================
+    return {"counted": True, "reason": "Loaded bucket counted.", "count": 1, "confidence": conf}
 
 def today():
     c = db()
     x = c.cursor()
-
     try:
         r = find_today_daily_count(x)
-
-        if not r:
-            return 0
-
-        return int(
-            r.get(
-                "bucket_count",
-                0
-            ) or 0
-        )
-
+        return int(r.get("bucket_count", 0) or 0) if r else 0
     finally:
         x.close()
         c.close()
-
-
-# ============================================================
-# DATASET
-# ============================================================
 
 def dataset_rows():
     c = db()
     x = c.cursor()
-
     try:
-        x.execute(
-            """
-            SELECT
-                di.id,
-                di.filename,
-                di.mime_type,
-                di.created_at,
-                COUNT(a.id) AS annotation_count
+        x.execute("""
+            SELECT di.id, di.filename, di.mime_type, di.created_at, COUNT(a.id) AS annotation_count
             FROM dataset_images di
-            LEFT JOIN annotations a
-                ON a.image_id=di.id
-            GROUP BY
-                di.id,
-                di.filename,
-                di.mime_type,
-                di.created_at
-            ORDER BY
-                di.id DESC
-            """
-        )
-
+            LEFT JOIN annotations a ON a.image_id = di.id
+            GROUP BY di.id, di.filename, di.mime_type, di.created_at
+            ORDER BY di.id DESC
+        """)
         return x.fetchall()
-
     finally:
         x.close()
         c.close()
 
-
-def save_image(
-    filename,
-    mime,
-    data,
-):
+def save_image(filename, mime, data):
     c = db()
     x = c.cursor()
-
     try:
-        x.execute(
-            """
-            INSERT INTO dataset_images
-                (
-                    filename,
-                    image_data,
-                    mime_type
-                )
-            VALUES
-                (
-                    %s,
-                    %s,
-                    %s
-                )
-            RETURNING id
-            """,
-            (
-                filename,
-                psycopg2.Binary(data),
-                mime,
-            ),
-        )
-
+        x.execute("INSERT INTO dataset_images (filename, image_data, mime_type) VALUES (%s, %s, %s) RETURNING id", (filename, psycopg2.Binary(data), mime))
         i = x.fetchone()["id"]
-
         c.commit()
-
         return i
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
 
-
-def save_annotations(
-    image_id,
-    anns,
-):
+def save_annotations(image_id, anns):
     c = db()
     x = c.cursor()
-
     try:
-        x.execute(
-            """
-            DELETE FROM annotations
-            WHERE image_id=%s
-            """,
-            (
-                image_id,
-            ),
-        )
-
+        x.execute("DELETE FROM annotations WHERE image_id=%s", (image_id,))
         for a in anns:
             x.execute(
-                """
-                INSERT INTO annotations
-                    (
-                        image_id,
-                        class_name,
-                        x_center,
-                        y_center,
-                        box_width,
-                        box_height
-                    )
-                VALUES
-                    (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s
-                    )
-                """,
-                (
-                    image_id,
-                    str(
-                        a.get(
-                            "class_name",
-                            "BUCKET_LOADED",
-                        )
-                    ),
-                    float(
-                        a.get(
-                            "x_center",
-                            0,
-                        )
-                    ),
-                    float(
-                        a.get(
-                            "y_center",
-                            0,
-                        )
-                    ),
-                    float(
-                        a.get(
-                            "box_width",
-                            0,
-                        )
-                    ),
-                    float(
-                        a.get(
-                            "box_height",
-                            0,
-                        )
-                    ),
-                ),
+                "INSERT INTO annotations (image_id, class_name, x_center, y_center, box_width, box_height) VALUES (%s, %s, %s, %s, %s, %s)",
+                (image_id, str(a.get("class_name", "BUCKET_LOADED")), float(a["x_center"]), float(a["y_center"]), float(a["box_width"]), float(a["box_height"]))
             )
-
         c.commit()
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
-
 
 def delete_image(i):
     c = db()
     x = c.cursor()
-
     try:
-        x.execute(
-            """
-            DELETE FROM dataset_images
-            WHERE id=%s
-            """,
-            (
-                i,
-            ),
-        )
-
+        x.execute("DELETE FROM dataset_images WHERE id=%s", (i,))
         ok = x.rowcount > 0
-
         c.commit()
-
         return ok
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
 
-
-# ============================================================
-# TRAINING STATE
-# ============================================================
-
-def set_training(
-    status,
-    msg,
-    progress,
-    run_id=None,
-    finished=False,
-):
-    progress = max(
-        0,
-        min(
-            100,
-            int(progress),
-        ),
-    )
-
+def set_training(status, msg, progress, run_id=None, finished=False):
+    progress = max(0, min(100, int(progress)))
     c = db()
     x = c.cursor()
-
     try:
         if run_id:
             if finished:
-                x.execute(
-                    """
-                    UPDATE training_state
-                    SET
-                        status=%s,
-                        message=%s,
-                        progress=%s,
-                        updated_at=NOW(),
-                        finished_at=NOW()
-                    WHERE id=1
-                      AND run_id=%s
-                    """,
-                    (
-                        status,
-                        msg,
-                        progress,
-                        str(run_id),
-                    ),
-                )
+                x.execute("UPDATE training_state SET status=%s, message=%s, progress=%s, updated_at=NOW(), finished_at=NOW() WHERE id=1 AND run_id=%s", (status, msg, progress, str(run_id)))
             else:
-                x.execute(
-                    """
-                    UPDATE training_state
-                    SET
-                        status=%s,
-                        message=%s,
-                        progress=%s,
-                        updated_at=NOW()
-                    WHERE id=1
-                      AND run_id=%s
-                    """,
-                    (
-                        status,
-                        msg,
-                        progress,
-                        str(run_id),
-                    ),
-                )
+                x.execute("UPDATE training_state SET status=%s, message=%s, progress=%s, updated_at=NOW() WHERE id=1 AND run_id=%s", (status, msg, progress, str(run_id)))
         else:
-            x.execute(
-                """
-                UPDATE training_state
-                SET
-                    status=%s,
-                    message=%s,
-                    progress=%s,
-                    updated_at=NOW()
-                WHERE id=1
-                """,
-                (
-                    status,
-                    msg,
-                    progress,
-                ),
-            )
-
+            x.execute("UPDATE training_state SET status=%s, message=%s, progress=%s, updated_at=NOW() WHERE id=1", (status, msg, progress))
         c.commit()
-
-    except Exception:
-        c.rollback()
-        raise
-
     finally:
         x.close()
         c.close()
-
-
-def mark_interrupted_on_startup():
-    c = db()
-    x = c.cursor()
-
-    try:
-        x.execute(
-            """
-            UPDATE training_state
-            SET
-                status='interrupted',
-                message=
-                    'Training interrupted because Render restarted. Start a new training run.',
-                progress=0,
-                updated_at=NOW(),
-                finished_at=NOW()
-            WHERE id=1
-              AND status IN (
-                  'preparing',
-                  'training',
-                  'saving'
-              )
-            """
-        )
-
-        if x.rowcount:
-            print(
-                "NEERIKA TRAINING: "
-                "previous active run marked INTERRUPTED."
-            )
-
-        c.commit()
-
-    except Exception:
-        c.rollback()
-        raise
-
-    finally:
-        x.close()
-        c.close()
-
-
-# ============================================================
-# TRAINING LOCK
-# ============================================================
 
 def acquire_training_lock():
     global TRAINING_LOCK_CONN
-
-    conn = psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=RealDictCursor,
-        connect_timeout=15,
-    )
-
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=15)
     conn.autocommit = True
-
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            pg_try_advisory_lock(%s)
-            AS locked
-        """,
-        (
-            TRAINING_LOCK_KEY,
-        ),
-    )
-
+    cur.execute("SELECT pg_try_advisory_lock(%s) AS locked", (TRAINING_LOCK_KEY,))
     row = cur.fetchone()
-
     cur.close()
-
-    if (
-        not row
-        or not row["locked"]
-    ):
+    if not row or not row["locked"]:
         conn.close()
         return None
-
     TRAINING_LOCK_CONN = conn
-
     return conn
 
-
-def release_training_lock(
-    conn=None
-):
+def release_training_lock(conn=None):
     global TRAINING_LOCK_CONN
-
-    conn = (
-        conn
-        or TRAINING_LOCK_CONN
-    )
-
+    conn = conn or TRAINING_LOCK_CONN
     if not conn:
         return
-
     try:
         cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT
-                pg_advisory_unlock(%s)
-            """,
-            (
-                TRAINING_LOCK_KEY,
-            ),
-        )
-
+        cur.execute("SELECT pg_advisory_unlock(%s)", (TRAINING_LOCK_KEY,))
         cur.close()
-
     except Exception:
         pass
-
     try:
         conn.close()
     except Exception:
         pass
-
     if conn is TRAINING_LOCK_CONN:
         TRAINING_LOCK_CONN = None
 
-
-# ============================================================
-# CLAIM TRAINING RUN
-# ============================================================
-
 def claim_training_run():
-    global TRAINING
-    global TRAINING_RUN_ID
-
+    global TRAINING, TRAINING_RUN_ID
     lock_conn = acquire_training_lock()
-
     if not lock_conn:
         return None
-
     run_id = uuid.uuid4().hex
-
     c = db()
     x = c.cursor()
-
     try:
         x.execute(
-            """
-            UPDATE training_state
-            SET
-                status='preparing',
-                message=
-                    'Training accepted. Preparing dataset...',
-                progress=1,
-                updated_at=NOW(),
-                run_id=%s,
-                server_id=%s,
-                started_at=NOW(),
-                finished_at=NULL
-            WHERE id=1
-              AND status NOT IN (
-                  'preparing',
-                  'training',
-                  'saving'
-              )
-            RETURNING id
-            """,
-            (
-                run_id,
-                SERVER_INSTANCE_ID,
-            ),
+            "UPDATE training_state SET status='preparing', message='Preparing dataset...', progress=1, updated_at=NOW(), run_id=%s, server_id=%s, started_at=NOW(), finished_at=NULL WHERE id=1 AND status NOT IN ('preparing', 'training', 'saving') RETURNING id",
+            (run_id, SERVER_INSTANCE_ID)
         )
-
         if not x.fetchone():
             c.rollback()
-
-            release_training_lock(
-                lock_conn
-            )
-
+            release_training_lock(lock_conn)
             return None
-
         c.commit()
-
         TRAINING = True
         TRAINING_RUN_ID = run_id
-
         return run_id
-
-    except Exception:
-        c.rollback()
-
-        release_training_lock(
-            lock_conn
-        )
-
-        raise
-
     finally:
         x.close()
         c.close()
-
-
-# ============================================================
-# BUILD DATASET
-# ============================================================
 
 def build_dataset():
     rows = dataset_rows()
+    if len(rows) < 1:
+        raise RuntimeError("Training inahitaji angalau picha 1 yenye annotations.")
 
-    if len(rows) < 2:
-        raise RuntimeError(
-            "Training inahitaji angalau picha 2."
-        )
-
-    root = tempfile.mkdtemp(
-        prefix="neerika_train_"
-    )
-
-    imgs = os.path.join(
-        root,
-        "images",
-    )
-
-    labs = os.path.join(
-        root,
-        "labels",
-    )
-
-    os.makedirs(
-        imgs,
-        exist_ok=True,
-    )
-
-    os.makedirs(
-        labs,
-        exist_ok=True,
-    )
+    root = tempfile.mkdtemp(prefix="neerika_train_")
+    imgs = os.path.join(root, "images")
+    labs = os.path.join(root, "labels")
+    os.makedirs(imgs, exist_ok=True)
+    os.makedirs(labs, exist_ok=True)
 
     usable = 0
-
     c = db()
     x = c.cursor()
-
     try:
         for r in rows:
-            x.execute(
-                """
-                SELECT
-                    image_data,
-                    mime_type,
-                    filename
-                FROM dataset_images
-                WHERE id=%s
-                """,
-                (
-                    r["id"],
-                ),
-            )
-
+            x.execute("SELECT image_data, mime_type, filename FROM dataset_images WHERE id=%s", (r["id"],))
             ir = x.fetchone()
-
             if not ir:
                 continue
 
-            x.execute(
-                """
-                SELECT
-                    class_name,
-                    x_center,
-                    y_center,
-                    box_width,
-                    box_height
-                FROM annotations
-                WHERE image_id=%s
-                ORDER BY id
-                """,
-                (
-                    r["id"],
-                ),
-            )
-
-            anns = [
-                a
-                for a in x.fetchall()
-                if str(
-                    a.get("class_name") or ""
-                ).upper()
-                == "BUCKET_LOADED"
-            ]
-
+            x.execute("SELECT class_name, x_center, y_center, box_width, box_height FROM annotations WHERE image_id=%s", (r["id"],))
+            anns = x.fetchall()
             if not anns:
                 continue
 
-            raw = _image_bytes(
-                ir.get("image_data")
-            )
-
+            raw = _image_bytes(ir.get("image_data"))
             if not raw:
-                print(
-                    "Skipping image",
-                    r["id"],
-                    "- invalid image_data",
-                )
                 continue
 
-            filename = str(
-                ir.get("filename")
-                or r.get("filename")
-                or ""
-            ).lower()
-
-            mime = str(
-                ir.get("mime_type")
-                or ""
-            ).lower()
-
-            if (
-                "png" in mime
-                or filename.endswith(".png")
-            ):
+            ext = ".jpg"
+            filename = str(ir.get("filename") or "").lower()
+            if "png" in filename or "png" in str(ir.get("mime_type")):
                 ext = ".png"
 
-            elif (
-                "webp" in mime
-                or filename.endswith(".webp")
-            ):
-                ext = ".webp"
-
-            else:
-                ext = ".jpg"
-
-            stem = (
-                "image_"
-                + str(r["id"])
-            )
-
-            with open(
-                os.path.join(
-                    imgs,
-                    stem + ext,
-                ),
-                "wb",
-            ) as f:
+            stem = "image_" + str(r["id"])
+            with open(os.path.join(imgs, stem + ext), "wb") as f:
                 f.write(raw)
 
-            label_path = os.path.join(
-                labs,
-                stem + ".txt",
-            )
-
-            valid_boxes = 0
-
-            with open(
-                label_path,
-                "w",
-                encoding="utf-8",
-            ) as f:
-
+            with open(os.path.join(labs, stem + ".txt"), "w", encoding="utf-8") as f:
                 for a in anns:
-                    try:
-                        xc = max(
-                            0,
-                            min(
-                                1,
-                                float(
-                                    a["x_center"]
-                                ),
-                            ),
-                        )
-
-                        yc = max(
-                            0,
-                            min(
-                                1,
-                                float(
-                                    a["y_center"]
-                                ),
-                            ),
-                        )
-
-                        bw = max(
-                            0,
-                            min(
-                                1,
-                                float(
-                                    a["box_width"]
-                                ),
-                            ),
-                        )
-
-                        bh = max(
-                            0,
-                            min(
-                                1,
-                                float(
-                                    a["box_height"]
-                                ),
-                            ),
-                        )
-
-                        if bw <= 0 or bh <= 0:
-                            continue
-
-                        f.write(
-                            f"0 {xc:.6f} "
-                            f"{yc:.6f} "
-                            f"{bw:.6f} "
-                            f"{bh:.6f}\n"
-                        )
-
-                        valid_boxes += 1
-
-                    except Exception:
-                        pass
-
-            if valid_boxes > 0:
-                usable += 1
-
+                    f.write(f"0 {a['x_center']} {a['y_center']} {a['box_width']} {a['box_height']}\n")
+            usable += 1
     finally:
         x.close()
         c.close()
 
-    if usable < 2:
-        shutil.rmtree(
-            root,
-            ignore_errors=True,
-        )
+    if usable < 1:
+        shutil.rmtree(root, ignore_errors=True)
+        raise RuntimeError("Hakuna picha zenye annotations zilizopatikana.")
 
-        raise RuntimeError(
-            "Angalau picha 2 zenye "
-            "BUCKET_LOADED annotations "
-            "zinahitajika."
-        )
+    yaml_path = os.path.join(root, "data.yaml")
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write(f"path: {root.replace(os.sep, '/')}\ntrain: images\nval: images\nnames:\n  0: BUCKET_LOADED\n")
 
-    yaml = os.path.join(
-        root,
-        "data.yaml",
-    )
+    return root, yaml_path, usable
 
-    with open(
-        yaml,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        f.write(
-            "path: "
-            + root.replace("\\", "/")
-            + "\n"
-            "train: images\n"
-            "val: images\n"
-            "names:\n"
-            "  0: BUCKET_LOADED\n"
-        )
-
-    return (
-        root,
-        yaml,
-        usable,
-    )
-
-
-# ============================================================
-# EPOCH MONITOR
-# ============================================================
-
-def read_epoch_from_results(
-    results_csv
-):
-    if not os.path.exists(results_csv):
-        return None
-
-    try:
-        with open(
-            results_csv,
-            "r",
-            encoding="utf-8",
-            errors="ignore",
-        ) as f:
-            rows = list(
-                csv.DictReader(f)
-            )
-
-        if not rows:
-            return None
-
-        last = rows[-1]
-
-        epoch_value = last.get("epoch")
-
-        if epoch_value is None:
-            return None
-
-        epoch = (
-            int(
-                float(
-                    epoch_value
-                )
-            )
-            + 1
-        )
-
-        return epoch
-
-    except Exception:
-        return None
-
-
-def epoch_monitor(
-    run_id,
-    results_csv,
-    total_epochs,
-    stop_event,
-):
-    last_epoch = 0
-
-    while not stop_event.is_set():
-        try:
-            epoch = read_epoch_from_results(
-                results_csv
-            )
-
-            if (
-                epoch is not None
-                and epoch > last_epoch
-            ):
-                last_epoch = epoch
-
-                epoch = min(
-                    epoch,
-                    total_epochs,
-                )
-
-                progress = min(
-                    90,
-                    20
-                    + int(
-                        (
-                            epoch
-                            / max(
-                                1,
-                                total_epochs,
-                            )
-                        )
-                        * 70
-                    ),
-                )
-
-                set_training(
-                    "training",
-                    (
-                        "Training YOLO... "
-                        f"Epoch {epoch}/"
-                        f"{total_epochs}"
-                    ),
-                    progress,
-                    run_id,
-                )
-
-        except Exception:
-            traceback.print_exc()
-
-        stop_event.wait(2)
-
-
-# ============================================================
-# TRAINING WORKER
-# ============================================================
-
-def training_worker(
-    run_id,
-    lock_conn,
-):
-    global TRAINING
-    global TRAINING_RUN_ID
-    global MODEL
-    global MODEL_ERROR
-
+def training_worker(run_id, lock_conn):
+    global TRAINING, TRAINING_RUN_ID, MODEL, MODEL_ERROR
     root = None
-
-    monitor_stop = threading.Event()
-    monitor_thread = None
-
     try:
-        set_training(
-            "preparing",
-            "Preparing dataset...",
-            5,
-            run_id,
-        )
+        set_training("preparing", "Preparing dataset...", 5, run_id)
+        root, yaml_path, usable = build_dataset()
 
-        root, yaml, usable = build_dataset()
-
-        set_training(
-            "training",
-            (
-                f"Dataset ready: "
-                f"{usable} images. "
-                f"Starting YOLO "
-                f"{TRAIN_EPOCHS} epochs..."
-            ),
-            18,
-            run_id,
-        )
-
-        model = YOLO(
-            "yolo11n.pt"
-        )
-
-        out = os.path.join(
-            root,
-            "runs",
-        )
-
-        os.makedirs(
-            out,
-            exist_ok=True,
-        )
-
-        run_dir = os.path.join(
-            out,
-            "neerika_bucket",
-        )
-
-        results_csv = os.path.join(
-            run_dir,
-            "results.csv",
-        )
+        set_training("training", f"Starting YOLO training ({TRAIN_EPOCHS} Epochs)...", 20, run_id)
+        model = YOLO("yolo11n.pt")
+        out_dir = os.path.join(root, "runs")
 
         def on_epoch_end(trainer):
             try:
-                epoch = (
-                    int(
-                        getattr(
-                            trainer,
-                            "epoch",
-                            0,
-                        )
-                    )
-                    + 1
-                )
-
-                total = int(
-                    getattr(
-                        trainer,
-                        "epochs",
-                        TRAIN_EPOCHS,
-                    )
-                    or TRAIN_EPOCHS
-                )
-
-                progress = min(
-                    90,
-                    20
-                    + int(
-                        (
-                            epoch
-                            / max(
-                                1,
-                                total,
-                            )
-                        )
-                        * 70
-                    ),
-                )
-
-                set_training(
-                    "training",
-                    (
-                        "Training YOLO... "
-                        f"Epoch {epoch}/"
-                        f"{total}"
-                    ),
-                    progress,
-                    run_id,
-                )
-
-            except Exception:
-                traceback.print_exc()
-
-        try:
-            model.add_callback(
-                "on_train_epoch_end",
-                on_epoch_end,
-            )
-        except Exception:
-            pass
-
-        try:
-            model.add_callback(
-                "on_fit_epoch_end",
-                on_epoch_end,
-            )
-        except Exception:
-            pass
-
-        set_training(
-            "training",
-            (
-                "Training YOLO for "
-                f"{TRAIN_EPOCHS} epochs... "
-                f"Epoch 0/{TRAIN_EPOCHS}"
-            ),
-            20,
-            run_id,
-        )
-
-        print("=" * 60)
-        print("NEERIKA TRAINING START")
-        print("Run:", run_id)
-        print("Epochs:", TRAIN_EPOCHS)
-        print("Images:", usable)
-        print("Workers: 0")
-        print("Batch: 4")
-        print("=" * 60)
-
-        monitor_thread = threading.Thread(
-            target=epoch_monitor,
-            args=(
-                run_id,
-                results_csv,
-                TRAIN_EPOCHS,
-                monitor_stop,
-            ),
-            daemon=True,
-        )
-
-        monitor_thread.start()
-
-        model.train(
-            data=yaml,
-            epochs=TRAIN_EPOCHS,
-            imgsz=YOLO_IMAGE_SIZE,
-            project=out,
-            name="neerika_bucket",
-            exist_ok=True,
-            verbose=True,
-            workers=0,
-            batch=4,
-            cache=False,
-            plots=False,
-        )
-
-        monitor_stop.set()
-
-        if monitor_thread:
-            monitor_thread.join(timeout=5)
-
-        set_training(
-            "saving",
-            "Training complete. Saving best.pt...",
-            93,
-            run_id,
-        )
-
-        best = os.path.join(
-            out,
-            "neerika_bucket",
-            "weights",
-            "best.pt",
-        )
-
-        if not os.path.exists(best):
-            raise RuntimeError(
-                "Training imekwisha "
-                "lakini best.pt "
-                "haikupatikana."
-            )
-
-        os.makedirs(
-            os.path.dirname(MODEL_PATH),
-            exist_ok=True,
-        )
-
-        shutil.copy2(
-            best,
-            MODEL_PATH,
-        )
-
-        os.makedirs(
-            os.path.dirname(
-                MODEL_BACKUP_PATH
-            ),
-            exist_ok=True,
-        )
-
-        shutil.copy2(
-            best,
-            MODEL_BACKUP_PATH,
-        )
-
-        set_training(
-            "saving",
-            (
-                "best.pt saved locally. "
-                "Saving best.pt to Supabase..."
-            ),
-            96,
-            run_id,
-        )
-
-        save_model_db(
-            MODEL_PATH
-        )
-
-        with MODEL_LOCK:
-            MODEL = YOLO(
-                MODEL_PATH
-            )
-
-            MODEL_ERROR = ""
-
-        set_training(
-            "completed",
-            (
-                "Training completed "
-                "successfully. "
-                f"{usable} images, "
-                f"{TRAIN_EPOCHS} epochs. "
-                "best.pt saved."
-            ),
-            100,
-            run_id,
-            finished=True,
-        )
-
-        print("=" * 60)
-        print("NEERIKA TRAINING COMPLETE")
-        print("Run:", run_id)
-        print("=" * 60)
-
-    except Exception as e:
-        traceback.print_exc()
-
-        monitor_stop.set()
-
-        try:
-            set_training(
-                "error",
-                "Training error: " + str(e),
-                0,
-                run_id,
-                finished=True,
-            )
-        except Exception:
-            traceback.print_exc()
-
-    finally:
-        monitor_stop.set()
-
-        if monitor_thread:
-            try:
-                monitor_thread.join(timeout=2)
+                epoch = int(getattr(trainer, "epoch", 0)) + 1
+                progress = min(90, 20 + int((epoch / TRAIN_EPOCHS) * 70))
+                set_training("training", f"Training YOLO... Epoch {epoch}/{TRAIN_EPOCHS}", progress, run_id)
             except Exception:
                 pass
 
-        if root:
-            shutil.rmtree(
-                root,
-                ignore_errors=True,
-            )
+        try:
+            model.add_callback("on_fit_epoch_end", on_epoch_end)
+        except Exception:
+            pass
 
+        model.train(data=yaml_path, epochs=TRAIN_EPOCHS, imgsz=YOLO_IMAGE_SIZE, project=out_dir, name="neerika", exist_ok=True, verbose=False)
+
+        set_training("saving", "Training complete. Saving model...", 95, run_id)
+        best = os.path.join(out_dir, "neerika", "weights", "best.pt")
+        if not os.path.exists(best):
+            raise RuntimeError("best.pt haikupatikana baada ya training.")
+
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        shutil.copy2(best, MODEL_PATH)
+        save_model_db(MODEL_PATH)
+
+        with MODEL_LOCK:
+            MODEL = YOLO(MODEL_PATH)
+            MODEL_ERROR = ""
+
+        set_training("completed", f"Training completed successfully! {usable} images trained.", 100, run_id, finished=True)
+    except Exception as e:
+        traceback.print_exc()
+        set_training("error", f"Error: {str(e)}", 0, run_id, finished=True)
+    finally:
+        if root:
+            shutil.rmtree(root, ignore_errors=True)
         TRAINING = False
         TRAINING_RUN_ID = None
-
-        release_training_lock(
-            lock_conn
-        )
-
-
-# ============================================================
-# START TRAINING
-# ============================================================
+        release_training_lock(lock_conn)
 
 def start_training_request():
-    global TRAINING
-    global TRAINING_RUN_ID
-
     run_id = claim_training_run()
-
     if not run_id:
         return None
-
-    lock_conn = TRAINING_LOCK_CONN
-
-    try:
-        threading.Thread(
-            target=training_worker,
-            args=(
-                run_id,
-                lock_conn,
-            ),
-            daemon=True,
-        ).start()
-
-        return run_id
-
-    except Exception:
-        try:
-            set_training(
-                "error",
-                "Training worker could not be started.",
-                0,
-                run_id,
-                finished=True,
-            )
-        finally:
-            TRAINING = False
-            TRAINING_RUN_ID = None
-
-            release_training_lock(
-                lock_conn
-            )
-
-        raise
-
+    threading.Thread(target=training_worker, args=(run_id, TRAINING_LOCK_CONN), daemon=True).start()
+    return run_id
 
 # ============================================================
-# DASHBOARD
+# PAGES & UI
 # ============================================================
 
 def dashboard():
-    body = """
+    body = f"""
 <div class="card">
     <h2>Mining Production Dashboard</h2>
-
-    <p>
-        NEERIKA BUCKET AI counts loaded
-        ore/material buckets coming from
-        the mine shaft.
-    </p>
+    <p>NEERIKA BUCKET AI counts loaded ore/material buckets coming from the mine shaft.</p>
 </div>
-
 <div class="grid">
-
     <div class="stat">
-        <div class="small">
-            Today's Loaded Buckets
-        </div>
-
-        <div class="num">
-            __COUNT__
-        </div>
+        <div class="small">Today's Loaded Buckets</div>
+        <div class="num">{today()}</div>
     </div>
-
     <div class="stat">
-        <div class="small">
-            AI System
-        </div>
-
-        <div class="num">
-            READY
-        </div>
+        <div class="small">AI System</div>
+        <div class="num">READY</div>
     </div>
-
-    <div class="stat">
-        <div class="small">
-            Counting Target
-        </div>
-
-        <div class="num">
-            LOADED
-        </div>
-    </div>
-
 </div>
-
 <div class="card">
-
-    <h3>
-        Not counted
-    </h3>
-
-    <ul>
-        <li>Empty buckets</li>
-        <li>People</li>
-        <li>Equipment</li>
-    </ul>
-
+    <a href="/camera"><button>Open Camera</button></a>
+    <a href="/training"><button class="secondary">Dataset & Training</button></a>
 </div>
-
-<div class="card">
-
-    <a href="/camera">
-        <button>
-            Open Camera
-        </button>
-    </a>
-
-    <a href="/training">
-        <button class="secondary">
-            Training
-        </button>
-    </a>
-
-</div>
-""".replace(
-        "__COUNT__",
-        esc(today()),
-    )
-
-    return layout(
-        "Dashboard",
-        body,
-        "Dashboard",
-    )
-
-
-# ============================================================
-# CAMERA
-# ============================================================
+"""
+    return layout("Dashboard", body, "Dashboard")
 
 def camera():
     body = r"""
 <div class="card">
-
-    <h2>
-        Bucket Camera
-    </h2>
-
-    <p class="small">
-        Take a camera frame and send it
-        to YOLO. Only BUCKET_LOADED is
-        eligible for counting.
-    </p>
-
-    <video
-        id="v"
-        autoplay
-        playsinline
-        style="
-            width:100%;
-            border-radius:12px;
-            background:#000
-        ">
-    </video>
-
-    <canvas
-        id="c"
-        style="display:none">
-    </canvas>
-
+    <h2>Bucket Camera</h2>
+    <p class="small">Take a camera frame and send it to YOLO to count loaded buckets.</p>
+    <video id="v" autoplay playsinline style="width:100%;border-radius:12px;background:#000"></video>
+    <canvas id="c" style="display:none"></canvas>
     <p>
-
-        <button onclick="start()">
-            Start Camera
-        </button>
-
-        <button
-            class="secondary"
-            onclick="stop()">
-            Stop
-        </button>
-
-        <button
-            class="success"
-            onclick="detectNow()">
-            Detect & Count
-        </button>
-
+        <button onclick="start()">Start Camera</button>
+        <button class="secondary" onclick="stop()">Stop</button>
+        <button class="success" onclick="detectNow()">Detect & Count</button>
     </p>
-
-    <div id="r" class="status">
-        Camera not started.
-    </div>
-
-    <div class="num" id="n">
-        0
-    </div>
-
+    <div id="r" class="status">Camera not started.</div>
+    <div class="num" id="n">0</div>
 </div>
-
 <script>
-
 let stream = null;
-
-const video =
-    document.getElementById('v');
-
-const canvas =
-    document.getElementById('c');
-
-const resultBox =
-    document.getElementById('r');
-
-const numberBox =
-    document.getElementById('n');
-
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const resultBox = document.getElementById('r');
+const numberBox = document.getElementById('n');
 
 async function start(){
-
     try{
-
-        stream =
-            await navigator
-            .mediaDevices
-            .getUserMedia({
-
-                video:{
-                    facingMode:'environment'
-                },
-
-                audio:false
-            });
-
+        stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
         video.srcObject = stream;
-
-        resultBox.innerText =
-            'Camera started.';
-
+        resultBox.innerText = 'Camera started.';
     }catch(e){
-
-        resultBox.innerText =
-            'Camera error: '
-            + e.message;
+        resultBox.innerText = 'Camera error: ' + e.message;
     }
 }
-
-
 function stop(){
-
-    if(stream){
-
-        stream
-            .getTracks()
-            .forEach(
-                t => t.stop()
-            );
-    }
-
+    if(stream) stream.getTracks().forEach(t => t.stop());
     stream = null;
-
-    resultBox.innerText =
-        'Camera stopped.';
+    resultBox.innerText = 'Camera stopped.';
 }
-
-
 async function detectNow(){
-
-    if(!video.videoWidth){
-
-        alert(
-            'Start camera first.'
-        );
-
-        return;
-    }
-
-    canvas.width =
-        video.videoWidth;
-
-    canvas.height =
-        video.videoHeight;
-
-    canvas
-        .getContext('2d')
-        .drawImage(
-            video,
-            0,
-            0,
-            canvas.width,
-            canvas.height
-        );
-
-    resultBox.innerText =
-        'Detecting...';
-
+    if(!video.videoWidth) { alert('Start camera first.'); return; }
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    resultBox.innerText = 'Detecting...';
     try{
-
-        const q =
-            await fetch(
-                '/api/detect',
-                {
-                    method:'POST',
-
-                    headers:{
-                        'Content-Type':
-                            'application/json'
-                    },
-
-                    body:
-                        JSON.stringify({
-                            image:
-                                canvas.toDataURL(
-                                    'image/jpeg',
-                                    .85
-                                ),
-                            count:true
-                        })
-                }
-            );
-
-        const d =
-            await q.json();
-
-        if(!q.ok){
-
-            throw new Error(
-                d.error ||
-                'Detection failed'
-            );
-        }
-
-        const loaded =
-            d.detections.filter(
-                x =>
-                    x.class_name ===
-                    'BUCKET_LOADED'
-            ).length;
-
-        resultBox.innerText =
-            'Detected: '
-            + d.detections.length
-            + ' | Loaded: '
-            + loaded
-            + ' | '
-            + (
-                d.count_result
-                ? d.count_result.reason
-                : ''
-            );
-
+        const q = await fetch('/api/detect', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({image:canvas.toDataURL('image/jpeg', .85), count:true})
+        });
+        const d = await q.json();
+        const loaded = d.detections.filter(x => x.class_name === 'BUCKET_LOADED').length;
+        resultBox.innerText = 'Detections: ' + d.detections.length + ' | Loaded: ' + loaded + ' | ' + (d.count_result ? d.count_result.reason : '');
         refresh();
-
     }catch(e){
-
-        resultBox.innerText =
-            'Error: '
-            + e.message;
+        resultBox.innerText = 'Error: ' + e.message;
     }
 }
-
-
 async function refresh(){
-
     try{
-
-        const q =
-            await fetch(
-                '/api/history',
-                {
-                    cache:'no-store'
-                }
-            );
-
-        const d =
-            await q.json();
-
-        numberBox.innerText =
-            d.today_count || 0;
-
+        const q = await fetch('/api/history');
+        const d = await q.json();
+        numberBox.innerText = d.today_count || 0;
     }catch(e){}
-
 }
-
-
 refresh();
-
 </script>
 """
-
-    return layout(
-        "Camera",
-        body,
-        "Camera",
-    )
-
-
-# ============================================================
-# BUCKETS
-# ============================================================
+    return layout("Camera", body, "Camera")
 
 def buckets():
     body = r"""
 <div class="card">
-
-    <h2>
-        Bucket Registration
-    </h2>
-
-    <div class="row">
-
-        <label>
-            Bucket Name
-        </label>
-
-        <input
-            id="name"
-            placeholder="NEERIKA Loaded Bucket">
-
-    </div>
-
-    <div class="row">
-
-        <label>
-            Description
-        </label>
-
-        <input
-            id="desc"
-            placeholder="Bucket description">
-
-    </div>
-
-    <button onclick="add()">
-        Register Bucket
-    </button>
-
+    <h2>Bucket Registration</h2>
+    <div class="row"><label>Bucket Name</label><input id="name" placeholder="NEERIKA Loaded Bucket"></div>
+    <div class="row"><label>Description</label><input id="desc" placeholder="Description"></div>
+    <button onclick="add()">Register Bucket</button>
     <div id="msg" class="status"></div>
-
 </div>
-
-<div class="card">
-
-    <h3>
-        Registered Buckets
-    </h3>
-
-    <div id="list">
-        Loading...
-    </div>
-
-</div>
-
+<div class="card"><h3>Registered Buckets</h3><div id="list">Loading...</div></div>
 <script>
-
 async function load(){
-
-    try{
-
-        const q =
-            await fetch(
-                '/api/buckets'
-            );
-
-        const d =
-            await q.json();
-
-        if(!q.ok){
-            list.innerHTML =
-                '<p>'
-                + (d.error || 'Error')
-                + '</p>';
-            return;
-        }
-
-        if(!d.buckets.length){
-
-            list.innerHTML =
-                '<p>No buckets registered.</p>';
-
-            return;
-        }
-
-        let h =
-            '<table>'
-            + '<tr>'
-            + '<th>Name</th>'
-            + '<th>Description</th>'
-            + '<th>Status</th>'
-            + '<th>Action</th>'
-            + '</tr>';
-
-        d.buckets.forEach(
-            b => {
-
-                h +=
-                    '<tr>'
-                    + '<td>'
-                    + e(b.name)
-                    + '</td>'
-
-                    + '<td>'
-                    + e(
-                        b.description || ''
-                    )
-                    + '</td>'
-
-                    + '<td>'
-                    + (
-                        b.active
-                        ? 'ACTIVE'
-                        : ''
-                    )
-                    + '</td>'
-
-                    + '<td>'
-                    + (
-                        b.active
-                        ?
-                        '<button disabled>'
-                        + 'Active'
-                        + '</button>'
-                        :
-                        '<button '
-                        + 'onclick="activate('
-                        + b.id
-                        + ')">'
-                        + 'Activate'
-                        + '</button>'
-                    )
-                    + '</td>'
-
-                    + '</tr>';
-            }
-        );
-
-        list.innerHTML =
-            h + '</table>';
-
-    }catch(err){
-
-        list.innerHTML =
-            '<p>Error: '
-            + e(err.message)
-            + '</p>';
-    }
+    const q = await fetch('/api/buckets');
+    const d = await q.json();
+    if(!d.buckets.length){ list.innerHTML='<p>No buckets.</p>'; return; }
+    let h='<table><tr><th>Name</th><th>Status</th></tr>';
+    d.buckets.forEach(b=>{ h+='<tr><td>'+b.name+'</td><td>'+(b.active?'ACTIVE':'')+'</td></tr>'; });
+    list.innerHTML=h+'</table>';
 }
-
-
 async function add(){
-
-    const nameValue =
-        document
-        .getElementById('name')
-        .value
-        .trim();
-
-    const descValue =
-        document
-        .getElementById('desc')
-        .value
-        .trim();
-
-    if(!nameValue){
-
-        alert(
-            'Enter bucket name'
-        );
-
-        return;
-    }
-
-    try{
-
-        const q =
-            await fetch(
-                '/api/buckets',
-                {
-                    method:'POST',
-
-                    headers:{
-                        'Content-Type':
-                            'application/json'
-                    },
-
-                    body:
-                        JSON.stringify({
-                            name:nameValue,
-                            description:descValue
-                        })
-                }
-            );
-
-        const d =
-            await q.json();
-
-        msg.innerText =
-            d.message
-            || d.error
-            || '';
-
-        if(q.ok){
-
-            document
-                .getElementById('name')
-                .value = '';
-
-            document
-                .getElementById('desc')
-                .value = '';
-
-            load();
-        }
-
-    }catch(err){
-
-        msg.innerText =
-            'Error: '
-            + err.message;
-    }
-}
-
-
-async function activate(id){
-
-    const q =
-        await fetch(
-            '/api/buckets/active',
-            {
-                method:'POST',
-
-                headers:{
-                    'Content-Type':
-                        'application/json'
-                },
-
-                body:
-                    JSON.stringify({
-                        id:id
-                    })
-            }
-        );
-
-    const d =
-        await q.json();
-
-    if(!q.ok){
-
-        alert(
-            d.error
-        );
-
-        return;
-    }
-
+    await fetch('/api/buckets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:document.getElementById('name').value, description:document.getElementById('desc').value})});
     load();
 }
-
-
-function e(s){
-
-    return String(s)
-
-        .replaceAll(
-            '&',
-            '&amp;'
-        )
-
-        .replaceAll(
-            '<',
-            '&lt;'
-        )
-
-        .replaceAll(
-            '>',
-            '&gt;'
-        )
-
-        .replaceAll(
-            '"',
-            '&quot;'
-        )
-
-        .replaceAll(
-            "'",
-            "&#039;"
-        );
-}
-
-
 load();
-
 </script>
 """
+    return layout("Buckets", body, "Buckets")
 
-    return layout(
-        "Buckets",
-        body,
-        "Buckets",
-    )
-
-
-# ============================================================
-# TRAINING PAGE
-# ============================================================
-
-def training():
-    c = db()
-    x = c.cursor()
-
-    try:
-        x.execute(
-            """
-            SELECT
-                status,
-                message,
-                progress,
-                updated_at,
-                run_id
-            FROM training_state
-            WHERE id=1
-            """
-        )
-
-        s = (
-            x.fetchone()
-            or {
-                "status": "idle",
-                "message": "Ready",
-                "progress": 0,
-                "updated_at": None,
-                "run_id": None,
-            }
-        )
-
-    finally:
-        x.close()
-        c.close()
-
+def training_page():
     rows = dataset_rows()
-
-    tr = ""
-
-    for r in rows:
-        tr += (
-            "<tr>"
-            "<td>"
-            + str(r["id"])
-            + "</td>"
-            "<td>"
-            + esc(r["filename"])
-            + "</td>"
-            "<td>"
-            + str(r["annotation_count"])
-            + "</td>"
-            "<td>"
-            '<button class="danger" '
-            'onclick="delimg('
-            + str(r["id"])
-            + ')">'
-            "Delete"
-            "</button>"
-            "</td>"
-            "</tr>"
-        )
-
-    if not tr:
-        tr = (
-            '<tr>'
-            '<td colspan="4">'
-            'No dataset images.'
-            '</td>'
-            '</tr>'
-        )
+    tr = "".join([f"<tr><td>{r['id']}</td><td>{esc(r['filename'])}</td><td>{r['annotation_count']}</td><td><a href='/annotate?id={r['id']}'><button class='secondary'>Annotate</button></a> <button class='danger' onclick='delimg({r['id']})'>Delete</button></td></tr>" for r in rows]) or "<tr><td colspan='4'>No images.</td></tr>"
 
     body = r"""
 <div class="card">
-
-    <h2>
-        YOLO Training Dataset
-    </h2>
-
-    <p class="small">
-        Upload images. Save
-        BUCKET_LOADED annotations
-        before training.
-    </p>
-
-    <div class="row">
-
-        <label>
-            Image
-        </label>
-
-        <input
-            id="file"
-            type="file"
-            accept="image/*">
-
-    </div>
-
-    <button onclick="upload()">
-        Upload Image
-    </button>
-
+    <h2>YOLO Training Dataset</h2>
+    <div class="row"><label>Upload Image</label><input id="file" type="file" accept="image/*"></div>
+    <button onclick="upload()">Upload & Annotate</button>
     <div id="up" class="status"></div>
-
 </div>
-
 <div class="card">
-
-    <h3>
-        Training Status
-    </h3>
-
-    <p>
-        Status:
-        <b id="st">
-            __STATUS__
-        </b>
-    </p>
-
-    <p id="ms">
-        __MESSAGE__
-    </p>
-
-    <p class="small">
-        Last update:
-        <span id="upd">
-            __UPDATED__
-        </span>
-    </p>
-
-    <div class="epoch" id="epoch">
-        Epoch 0/__EPOCHS__
-    </div>
-
-    <div class="progress">
-
-        <div
-            id="bar"
-            class="bar"
-            style="width:__PROGRESS__%">
-
-            __PROGRESS__%
-
-        </div>
-
-    </div>
-
+    <h3>Training Status</h3>
+    <p>Status: <b id="st">idle</b></p>
+    <p id="ms">Ready</p>
+    <div class="epoch" id="epoch">Epoch 0/__EPOCHS__</div>
+    <div class="progress"><div id="bar" class="bar" style="width:0%">0%</div></div>
     <br>
-
-    <button
-        id="startBtn"
-        class="success"
-        onclick="startTrain()">
-
-        Start Training
-
-    </button>
-
-    <button
-        class="secondary"
-        onclick="poll()">
-
-        Refresh Status
-
-    </button>
-
+    <button id="startBtn" class="success" onclick="startTrain()">Start Training</button>
+    <button class="secondary" onclick="poll()">Refresh Status</button>
 </div>
-
 <div class="card">
-
-    <h3>
-        Dataset
-    </h3>
-
-    <table>
-
-        <tr>
-            <th>ID</th>
-            <th>Filename</th>
-            <th>Annotations</th>
-            <th>Action</th>
-        </tr>
-
-        __ROWS__
-
-    </table>
-
+    <h3>Dataset Images</h3>
+    <table><tr><th>ID</th><th>Filename</th><th>Annotations</th><th>Action</th></tr>__ROWS__</table>
 </div>
-
 <script>
-
-let pollTimer = null;
-
-const TOTAL_EPOCHS =
-    __EPOCHS__;
-
-const activeStates = [
-    'preparing',
-    'training',
-    'saving'
-];
-
-
-const st =
-    document.getElementById('st');
-
-const ms =
-    document.getElementById('ms');
-
-const upd =
-    document.getElementById('upd');
-
-const bar =
-    document.getElementById('bar');
-
-const epoch =
-    document.getElementById('epoch');
-
-const startBtn =
-    document.getElementById('startBtn');
-
-const file =
-    document.getElementById('file');
-
-const up =
-    document.getElementById('up');
-
-
-function setStatus(d){
-
-    st.innerText =
-        d.status || 'idle';
-
-    ms.innerText =
-        d.message || '';
-
-    const p =
-        Number(
-            d.progress || 0
-        );
-
-    bar.style.width =
-        p + '%';
-
-    bar.innerText =
-        p + '%';
-
-    upd.innerText =
-        d.updated_at || '-';
-
-    const message =
-        String(
-            d.message || ''
-        );
-
-    const match =
-        message.match(
-            /Epoch\s+(\d+)\s*\/\s*(\d+)/i
-        );
-
-    if(match){
-
-        epoch.innerText =
-            'Epoch '
-            + match[1]
-            + '/'
-            + match[2];
-
-    }else if(
-        String(
-            d.status || ''
-        ).toLowerCase()
-        === 'completed'
-    ){
-
-        epoch.innerText =
-            'Epoch '
-            + TOTAL_EPOCHS
-            + '/'
-            + TOTAL_EPOCHS;
-    }
-
-    const active =
-        activeStates.includes(
-            String(
-                d.status || ''
-            ).toLowerCase()
-        );
-
-    startBtn.disabled =
-        active;
-
-    startBtn.innerText =
-        active
-        ? 'Training Running...'
-        : 'Start Training';
-
-    if(active){
-
-        if(pollTimer)
-            clearTimeout(
-                pollTimer
-            );
-
-        pollTimer =
-            setTimeout(
-                poll,
-                2000
-            );
-    }
-}
-
-
 async function upload(){
-
-    const f =
-        file.files[0];
-
-    if(!f){
-
-        alert(
-            'Choose image'
-        );
-
-        return;
-    }
-
-    const rd =
-        new FileReader();
-
-    rd.onload =
-        async () => {
-
-            try{
-
-                const q =
-                    await fetch(
-                        '/api/dataset/upload',
-                        {
-                            method:'POST',
-
-                            headers:{
-                                'Content-Type':
-                                    'application/json'
-                            },
-
-                            body:
-                                JSON.stringify({
-                                    filename:f.name,
-                                    mime_type:f.type,
-                                    data:rd.result
-                                })
-                        }
-                    );
-
-                const d =
-                    await q.json();
-
-                up.innerText =
-                    d.message
-                    || d.error
-                    || '';
-
-                if(q.ok){
-
-                    setTimeout(
-                        () => {
-                            location.reload();
-                        },
-                        500
-                    );
-                }
-
-            }catch(err){
-
-                up.innerText =
-                    'Upload error: '
-                    + err.message;
-            }
-        };
-
+    const f = document.getElementById('file').files[0];
+    if(!f) return alert('Choose image');
+    const rd = new FileReader();
+    rd.onload = async () => {
+        const q = await fetch('/api/dataset/upload', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:f.name, mime_type:f.type, data:rd.result})});
+        const d = await q.json();
+        if(d.id) window.location.href = '/annotate?id=' + d.id;
+    };
     rd.readAsDataURL(f);
 }
-
-
 async function delimg(id){
-
-    if(
-        !confirm(
-            'Delete image?'
-        )
-    )
-        return;
-
-    const q =
-        await fetch(
-            '/api/dataset/delete',
-            {
-                method:'POST',
-
-                headers:{
-                    'Content-Type':
-                        'application/json'
-                },
-
-                body:
-                    JSON.stringify({
-                        id:id
-                    })
-            }
-        );
-
-    const d =
-        await q.json();
-
-    if(!q.ok){
-
-        alert(
-            d.error
-        );
-
-        return;
-    }
-
-    location.reload();
+    if(confirm('Delete?')) { await fetch('/api/dataset/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:id})}); location.reload(); }
 }
-
-
 async function startTrain(){
-
-    startBtn.disabled =
-        true;
-
-    try{
-
-        const q =
-            await fetch(
-                '/api/training/start',
-                {
-                    method:'POST',
-
-                    headers:{
-                        'Content-Type':
-                            'application/json'
-                    }
-                }
-            );
-
-        const d =
-            await q.json();
-
-        if(!q.ok){
-
-            alert(
-                d.error
-                ||
-                'Training could not be started.'
-            );
-        }
-
-        await poll();
-
-    }catch(err){
-
-        alert(
-            'Connection error: '
-            + err.message
-        );
-
-        await poll();
-    }
+    await fetch('/api/training/start', {method:'POST'});
+    poll();
 }
-
-
 async function poll(){
+    const q = await fetch('/api/training/status');
+    const d = await q.json();
+    document.getElementById('st').innerText = d.status;
+    document.getElementById('ms').innerText = d.message;
+    const p = d.progress || 0;
+    document.getElementById('bar').style.width = p + '%';
+    document.getElementById('bar').innerText = p + '%';
+    if(['preparing','training','saving'].includes(d.status)) setTimeout(poll, 2000);
+}
+poll();
+</script>
+""".replace("__ROWS__", tr).replace("__EPOCHS__", str(TRAIN_EPOCHS))
+    return layout("Training", body, "Training")
 
-    try{
+def annotate_page(image_id):
+    body = r"""
+<div class="card">
+    <h2>Image Annotation (Draw Bounding Box)</h2>
+    <p class="small">Click na buruta picha kuweka box la BUCKET_LOADED.</p>
+    <div style="position:relative;display:inline-block;max-width:100%">
+        <canvas id="canvas" style="cursor:crosshair;max-width:100%;border:1px solid #ccc"></canvas>
+    </div>
+    <p>
+        <button class="success" onclick="saveAnns()">Save Annotations</button>
+        <a href="/training"><button class="secondary">Back to Training</button></a>
+    </p>
+    <div id="status" class="status"></div>
+</div>
+<script>
+const imageId = __IMAGE_ID__;
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let img = new Image();
+let boxes = [];
+let drawing = false;
+let startX, startY;
 
-        const q =
-            await fetch(
-                '/api/training/status',
-                {
-                    cache:'no-store'
-                }
-            );
+img.onload = () => {
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    draw();
+    loadExisting();
+};
+img.src = '/api/dataset/image/' + imageId;
 
-        const d =
-            await q.json();
-
-        setStatus(d);
-
-    }catch(err){
-
-        ms.innerText =
-            'Status connection error. Retrying...';
-
-        if(pollTimer)
-            clearTimeout(
-                pollTimer
-            );
-
-        pollTimer =
-            setTimeout(
-                poll,
-                3000
-            );
-    }
+async function loadExisting(){
+    const q = await fetch('/api/dataset/annotations/' + imageId);
+    const d = await q.json();
+    boxes = (d.annotations || []).map(a => {
+        return {
+            x: (a.x_center - a.box_width / 2) * canvas.width,
+            y: (a.y_center - a.box_height / 2) * canvas.height,
+            w: a.box_width * canvas.width,
+            h: a.box_height * canvas.height
+        };
+    });
+    draw();
 }
 
+canvas.onmousedown = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    startX = (e.clientX - rect.left) * scaleX;
+    startY = (e.clientY - rect.top) * scaleY;
+    drawing = true;
+};
 
-poll();
+canvas.onmousemove = (e) => {
+    if(!drawing) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const curX = (e.clientX - rect.left) * scaleX;
+    const curY = (e.clientY - rect.top) * scaleY;
+    draw();
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(startX, startY, curX - startX, curY - startY);
+};
 
+canvas.onmouseup = (e) => {
+    if(!drawing) return;
+    drawing = false;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const endX = (e.clientX - rect.left) * scaleX;
+    const endY = (e.clientY - rect.top) * scaleY;
+    const w = endX - startX;
+    const h = endY - startY;
+    if(Math.abs(w) > 5 && Math.abs(h) > 5){
+        boxes.push({x: w < 0 ? endX : startX, y: h < 0 ? endY : startY, w: Math.abs(w), h: Math.abs(h)});
+    }
+    draw();
+};
+
+function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(img,0,0);
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = 3;
+    boxes.forEach(b => {
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = 'rgba(34, 197, 94, 0.2)';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+    });
+}
+
+async function saveAnns(){
+    const formatted = boxes.map(b => {
+        return {
+            class_name: 'BUCKET_LOADED',
+            x_center: (b.x + b.w / 2) / canvas.width,
+            y_center: (b.y + b.h / 2) / canvas.height,
+            box_width: b.w / canvas.width,
+            box_height: b.h / canvas.height
+        };
+    });
+    const q = await fetch('/api/dataset/annotations', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({image_id: imageId, annotations: formatted})
+    });
+    const d = await q.json();
+    document.getElementById('status').innerText = d.message || 'Saved!';
+}
 </script>
-"""
-
-    body = (
-        body
-        .replace(
-            "__STATUS__",
-            esc(s["status"])
-        )
-        .replace(
-            "__MESSAGE__",
-            esc(s["message"])
-        )
-        .replace(
-            "__PROGRESS__",
-            esc(s["progress"])
-        )
-        .replace(
-            "__UPDATED__",
-            esc(
-                s["updated_at"]
-                or "-"
-            )
-        )
-        .replace(
-            "__ROWS__",
-            tr
-        )
-        .replace(
-            "__EPOCHS__",
-            str(TRAIN_EPOCHS)
-        )
-    )
-
-    return layout(
-        "Training",
-        body,
-        "Training",
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
+""".replace("__IMAGE_ID__", str(image_id))
+    return layout("Annotate", body, "Training")
 
 def history():
     body = r"""
 <div class="card">
-
-    <h2>
-        Production History
-    </h2>
-
-    <button onclick="load()">
-        Refresh
-    </button>
-
-    <a href="/api/history.csv">
-        <button class="secondary">
-            Export CSV
-        </button>
-    </a>
-
+    <h2>Production History</h2>
+    <a href="/api/history.csv"><button class="secondary">Export CSV</button></a>
 </div>
-
-<div class="card" id="table">
-    Loading...
-</div>
-
+<div class="card" id="table">Loading...</div>
 <script>
-
 async function load(){
-
-    try{
-
-        const q =
-            await fetch(
-                '/api/history',
-                {
-                    cache:'no-store'
-                }
-            );
-
-        const d =
-            await q.json();
-
-        if(!q.ok){
-
-            table.innerHTML =
-                '<p>'
-                + (
-                    d.error || 'Error'
-                )
-                + '</p>';
-
-            return;
-        }
-
-        let h =
-            '<table>'
-            + '<tr>'
-            + '<th>Date</th>'
-            + '<th>Loaded Buckets</th>'
-            + '</tr>';
-
-        d.history.forEach(
-            r => {
-
-                h +=
-                    '<tr>'
-                    + '<td>'
-                    + r.count_date
-                    + '</td>'
-                    + '<td>'
-                    + r.bucket_count
-                    + '</td>'
-                    + '</tr>';
-            }
-        );
-
-        h +=
-            '</table>';
-
-        table.innerHTML =
-            d.history.length
-            ? h
-            : '<p>No history yet.</p>';
-
-    }catch(err){
-
-        table.innerHTML =
-            '<p>Error: '
-            + err.message
-            + '</p>';
-    }
+    const q = await fetch('/api/history');
+    const d = await q.json();
+    let h = '<table><tr><th>Date</th><th>Loaded Buckets</th></tr>';
+    (d.history || []).forEach(r => { h += '<tr><td>' + r.count_date + '</td><td>' + r.bucket_count + '</td></tr>'; });
+    document.getElementById('table').innerHTML = h + '</table>';
 }
-
-
 load();
-
 </script>
 """
-
-    return layout(
-        "History",
-        body,
-        "History",
-    )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
+    return layout("History", body, "History")
 
 def settings():
-    body = """
+    body = f"""
 <div class="card">
-
-    <h2>
-        Settings
-    </h2>
-
-    <p>
-        YOLO confidence:
-        <b>__CONF__</b>
-    </p>
-
-    <p>
-        Image size:
-        <b>__SIZE__</b>
-    </p>
-
-    <p>
-        Training epochs:
-        <b>__EPOCHS__</b>
-    </p>
-
-    <p>
-        Count cooldown:
-        <b>
-            __COOLDOWN__
-            seconds
-        </b>
-    </p>
-
+    <h2>Settings</h2>
+    <p>Training Epochs: <b>{TRAIN_EPOCHS}</b></p>
+    <p>Model Status: <b>{'Loaded' if MODEL is not None else 'Not Loaded'}</b></p>
 </div>
-
-<div class="card">
-
-    <h3>
-        Model
-    </h3>
-
-    <p>
-        __MODEL__
-    </p>
-
-    <p>
-        Database count_date type:
-        <b>__DATE_TYPE__</b>
-    </p>
-
-    <p class="small">
-        DATABASE_URL remains in
-        Render Environment Variables
-        and is not written into this
-        source code.
-    </p>
-
-</div>
-""".replace(
-        "__CONF__",
-        esc(YOLO_CONFIDENCE)
-    ).replace(
-        "__SIZE__",
-        esc(YOLO_IMAGE_SIZE)
-    ).replace(
-        "__EPOCHS__",
-        esc(TRAIN_EPOCHS)
-    ).replace(
-        "__COOLDOWN__",
-        esc(COUNT_COOLDOWN_SECONDS)
-    ).replace(
-        "__MODEL__",
-        esc(
-            "Loaded"
-            if MODEL is not None
-            else "Not loaded yet"
-        )
-    ).replace(
-        "__DATE_TYPE__",
-        esc(
-            DAILY_COUNTS_DATE_TYPE
-        )
-    )
-
-    return layout(
-        "Settings",
-        body,
-        "Settings",
-    )
-
+"""
+    return layout("Settings", body, "Settings")
 
 # ============================================================
 # HTTP HANDLER
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
-
-    def log_message(
-        self,
-        fmt,
-        *args
-    ):
-        print(
-            f"{self.address_string()} - "
-            f"{fmt % args}"
-        )
-
     def body_json(self):
-        try:
-            n = int(
-                self.headers.get(
-                    "Content-Length",
-                    "0",
-                )
-            )
-        except Exception:
-            n = 0
-
-        if n > MAX_JSON_BYTES:
-            raise ValueError(
-                "Request too large."
-            )
-
-        raw = self.rfile.read(n)
-
-        return (
-            json.loads(
-                raw.decode("utf-8")
-            )
-            if raw
-            else {}
-        )
-
-    def do_HEAD(self):
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8",
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-store",
-        )
-
-        self.end_headers()
-
-    # ========================================================
-    # GET
-    # ========================================================
+        n = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
     def do_GET(self):
-        try:
-            p = urlparse(
-                self.path
-            ).path
+        p = urlparse(self.path)
+        path = p.path
+        query = p.query
 
-            pages = {
-                "/": dashboard,
-                "/camera": camera,
-                "/buckets": buckets,
-                "/training": training,
-                "/history": history,
-                "/settings": settings,
-            }
+        if path == "/": return html_out(self, dashboard())
+        if path == "/camera": return html_out(self, camera())
+        if path == "/buckets": return html_out(self, buckets())
+        if path == "/training": return html_out(self, training_page())
+        if path == "/history": return html_out(self, history())
+        if path == "/settings": return html_out(self, settings())
 
-            if p in pages:
-                return html_out(
-                    self,
-                    pages[p]()
-                )
+        if path == "/annotate":
+            q_id = 0
+            for part in query.split("&"):
+                if part.startswith("id="):
+                    try: q_id = int(part.split("=")[1])
+                    except: pass
+            return html_out(self, annotate_page(q_id))
 
-            # ------------------------------------------------
-            # HEALTH
-            # ------------------------------------------------
+        if path == "/api/buckets":
+            c = db()
+            x = c.cursor()
+            try: x.execute("SELECT * FROM buckets ORDER BY id DESC"); r = x.fetchall()
+            finally: x.close(); c.close()
+            return json_out(self, {"buckets": r})
 
-            if p == "/health":
-                return json_out(
-                    self,
-                    {
-                        "status": "ok",
-                        "database_configured":
-                            bool(DATABASE_URL),
-                        "model_loaded":
-                            MODEL is not None,
-                        "training":
-                            TRAINING,
-                        "count_date_type":
-                            DAILY_COUNTS_DATE_TYPE,
-                    },
-                )
+        if path == "/api/training/status":
+            c = db()
+            x = c.cursor()
+            try: x.execute("SELECT * FROM training_state WHERE id=1"); r = x.fetchone()
+            finally: x.close(); c.close()
+            return json_out(self, r or {})
 
-            # ------------------------------------------------
-            # BUCKETS
-            # ------------------------------------------------
+        if path == "/api/history":
+            c = db()
+            x = c.cursor()
+            try: x.execute("SELECT count_date::text AS count_date, bucket_count FROM daily_counts ORDER BY count_date DESC LIMIT 50"); r = x.fetchall()
+            finally: x.close(); c.close()
+            return json_out(self, {"history": r, "today_count": today()})
 
-            if p == "/api/buckets":
-                c = db()
-                x = c.cursor()
+        if path.startswith("/api/dataset/image/"):
+            i = int(path.rsplit("/", 1)[1])
+            c = db()
+            x = c.cursor()
+            try: x.execute("SELECT image_data, mime_type FROM dataset_images WHERE id=%s", (i,)); r = x.fetchone()
+            finally: x.close(); c.close()
+            if not r: return error_out(self, "Not found", 404)
+            b = _image_bytes(r["image_data"])
+            self.send_response(200)
+            self.send_header("Content-Type", r["mime_type"] or "image/jpeg")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
 
-                try:
-                    x.execute(
-                        """
-                        SELECT
-                            id,
-                            name,
-                            description,
-                            active,
-                            created_at
-                        FROM buckets
-                        ORDER BY id DESC
-                        """
-                    )
+        if path.startswith("/api/dataset/annotations/"):
+            i = int(path.rsplit("/", 1)[1])
+            c = db()
+            x = c.cursor()
+            try: x.execute("SELECT * FROM annotations WHERE image_id=%s", (i,)); r = x.fetchall()
+            finally: x.close(); c.close()
+            return json_out(self, {"annotations": r})
 
-                    r = x.fetchall()
-
-                finally:
-                    x.close()
-                    c.close()
-
-                return json_out(
-                    self,
-                    {
-                        "buckets": r
-                    },
-                )
-
-            # ------------------------------------------------
-            # TRAINING STATUS
-            # ------------------------------------------------
-
-            if p == "/api/training/status":
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        SELECT
-                            status,
-                            message,
-                            progress,
-                            updated_at,
-                            run_id,
-                            server_id,
-                            started_at,
-                            finished_at
-                        FROM training_state
-                        WHERE id=1
-                        """
-                    )
-
-                    r = x.fetchone()
-
-                finally:
-                    x.close()
-                    c.close()
-
-                return json_out(
-                    self,
-                    r
-                    or {
-                        "status": "idle",
-                        "message": "",
-                        "progress": 0,
-                    },
-                )
-
-            # ------------------------------------------------
-            # HISTORY
-            # ------------------------------------------------
-
-            if p == "/api/history":
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        SELECT
-                            count_date::text
-                                AS count_date,
-                            bucket_count,
-                            updated_at
-                        FROM daily_counts
-                        ORDER BY
-                            count_date DESC
-                        LIMIT 100
-                        """
-                    )
-
-                    r = x.fetchall()
-
-                finally:
-                    x.close()
-                    c.close()
-
-                return json_out(
-                    self,
-                    {
-                        "history": r,
-                        "today_count": today(),
-                    },
-                )
-
-            # ------------------------------------------------
-            # HISTORY CSV
-            # ------------------------------------------------
-
-            if p == "/api/history.csv":
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        SELECT
-                            count_date::text
-                                AS count_date,
-                            bucket_count,
-                            updated_at
-                        FROM daily_counts
-                        ORDER BY
-                            count_date DESC
-                        """
-                    )
-
-                    r = x.fetchall()
-
-                finally:
-                    x.close()
-                    c.close()
-
-                o = io.StringIO()
-
-                w = csv.writer(o)
-
-                w.writerow(
-                    [
-                        "Date",
-                        "Loaded Buckets",
-                        "Updated At",
-                    ]
-                )
-
-                for z in r:
-                    w.writerow(
-                        [
-                            z["count_date"],
-                            z["bucket_count"],
-                            z["updated_at"],
-                        ]
-                    )
-
-                b = o.getvalue().encode(
-                    "utf-8"
-                )
-
-                self.send_response(200)
-
-                self.send_header(
-                    "Content-Type",
-                    "text/csv; charset=utf-8",
-                )
-
-                self.send_header(
-                    "Content-Length",
-                    str(len(b)),
-                )
-
-                self.send_header(
-                    "Content-Disposition",
-                    "attachment; "
-                    "filename="
-                    "neerika_history.csv",
-                )
-
-                self.end_headers()
-
-                self.wfile.write(b)
-
-                return
-
-            # ------------------------------------------------
-            # DATASET IMAGE
-            # ------------------------------------------------
-
-            if p.startswith(
-                "/api/dataset/image/"
-            ):
-                i = int(
-                    p.rsplit(
-                        "/",
-                        1
-                    )[1]
-                )
-
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        SELECT
-                            image_data,
-                            mime_type
-                        FROM dataset_images
-                        WHERE id=%s
-                        """,
-                        (
-                            i,
-                        ),
-                    )
-
-                    r = x.fetchone()
-
-                finally:
-                    x.close()
-                    c.close()
-
-                if not r:
-                    return error_out(
-                        self,
-                        "Image not found.",
-                        404,
-                    )
-
-                b = _image_bytes(
-                    r["image_data"]
-                )
-
-                self.send_response(200)
-
-                self.send_header(
-                    "Content-Type",
-                    r["mime_type"]
-                    or "image/jpeg",
-                )
-
-                self.send_header(
-                    "Content-Length",
-                    str(len(b)),
-                )
-
-                self.end_headers()
-
-                self.wfile.write(b)
-
-                return
-
-            return error_out(
-                self,
-                "Not found.",
-                404,
-            )
-
-        except Exception as e:
-            traceback.print_exc()
-
-            return error_out(
-                self,
-                e,
-                500,
-            )
-
-    # ========================================================
-    # POST
-    # ========================================================
+        return error_out(self, "Not found", 404)
 
     def do_POST(self):
-        try:
-            p = urlparse(
-                self.path
-            ).path
+        p = urlparse(self.path).path
+        d = self.body_json()
 
-            # ------------------------------------------------
-            # DETECT
-            # ------------------------------------------------
+        if p == "/api/detect":
+            s = d.get("image", "")
+            if "," in s: s = s.split(",", 1)[1]
+            b = base64.b64decode(s)
+            det = detect(b)
+            cr = count_loaded(det) if d.get("count", True) else None
+            return json_out(self, {"detections": det, "count_result": cr})
 
-            if p == "/api/detect":
-                d = self.body_json()
+        if p == "/api/buckets":
+            c = db()
+            x = c.cursor()
+            try:
+                x.execute("INSERT INTO buckets (name, description) VALUES (%s, %s)", (d.get("name"), d.get("description")))
+                c.commit()
+            finally: x.close(); c.close()
+            return json_out(self, {"message": "Success"})
 
-                s = d.get(
-                    "image",
-                    "",
-                )
+        if p == "/api/dataset/upload":
+            s = d.get("data", "")
+            if "," in s: s = s.split(",", 1)[1]
+            b = base64.b64decode(s)
+            i = save_image(d.get("filename", "img.jpg"), d.get("mime_type", "image/jpeg"), b)
+            return json_out(self, {"id": i})
 
-                if not s:
-                    raise ValueError(
-                        "Image is required."
-                    )
+        if p == "/api/dataset/delete":
+            delete_image(int(d["id"]))
+            return json_out(self, {"message": "Deleted"})
 
-                if "," in s:
-                    s = s.split(
-                        ",",
-                        1
-                    )[1]
+        if p == "/api/dataset/annotations":
+            save_annotations(int(d["image_id"]), d.get("annotations", []))
+            return json_out(self, {"message": "Annotations saved successfully."})
 
-                try:
-                    b = base64.b64decode(
-                        s,
-                        validate=True,
-                    )
-                except Exception:
-                    raise ValueError(
-                        "Invalid image data."
-                    )
+        if p == "/api/training/start":
+            run_id = start_training_request()
+            if not run_id: return error_out(self, "Training tayari inaendelea.", 409)
+            return json_out(self, {"run_id": run_id})
 
-                if len(b) > MAX_UPLOAD_BYTES:
-                    raise ValueError(
-                        "Image too large."
-                    )
-
-                det = detect(b)
-
-                cr = (
-                    count_loaded(det)
-                    if d.get(
-                        "count",
-                        True
-                    )
-                    else None
-                )
-
-                return json_out(
-                    self,
-                    {
-                        "detections": det,
-                        "count_result": cr,
-                    },
-                )
-
-            # ------------------------------------------------
-            # REGISTER BUCKET
-            # ------------------------------------------------
-
-            if p == "/api/buckets":
-                d = self.body_json()
-
-                name = str(
-                    d.get(
-                        "name",
-                        ""
-                    )
-                ).strip()
-
-                desc = str(
-                    d.get(
-                        "description",
-                        ""
-                    )
-                ).strip()
-
-                if not name:
-                    raise ValueError(
-                        "Bucket name is required."
-                    )
-
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        INSERT INTO buckets
-                            (
-                                name,
-                                description
-                            )
-                        VALUES
-                            (
-                                %s,
-                                %s
-                            )
-                        RETURNING id
-                        """,
-                        (
-                            name,
-                            desc,
-                        ),
-                    )
-
-                    i = x.fetchone()["id"]
-
-                    c.commit()
-
-                except Exception:
-                    c.rollback()
-                    raise
-
-                finally:
-                    x.close()
-                    c.close()
-
-                return json_out(
-                    self,
-                    {
-                        "message":
-                            "Bucket registered successfully.",
-                        "id": i,
-                    },
-                )
-
-            # ------------------------------------------------
-            # ACTIVATE BUCKET
-            # ------------------------------------------------
-
-            if p == "/api/buckets/active":
-                d = self.body_json()
-
-                i = int(
-                    d["id"]
-                )
-
-                c = db()
-                x = c.cursor()
-
-                try:
-                    x.execute(
-                        """
-                        UPDATE buckets
-                        SET active=FALSE
-                        """
-                    )
-
-                    x.execute(
-                        """
-                        UPDATE buckets
-                        SET active=TRUE
-                        WHERE id=%s
-                        """,
-                        (
-                            i,
-                        ),
-                    )
-
-                    ok = (
-                        x.rowcount > 0
-                    )
-
-                    c.commit()
-
-                except Exception:
-                    c.rollback()
-                    raise
-
-                finally:
-                    x.close()
-                    c.close()
-
-                return json_out(
-                    self,
-                    (
-                        {
-                            "message":
-                                "Bucket activated."
-                        }
-                        if ok
-                        else
-                        {
-                            "error":
-                                "Bucket not found."
-                        }
-                    ),
-                    200
-                    if ok
-                    else 404,
-                )
-
-            # ------------------------------------------------
-            # DATASET UPLOAD
-            # ------------------------------------------------
-
-            if p == "/api/dataset/upload":
-                d = self.body_json()
-
-                s = d.get(
-                    "data",
-                    "",
-                )
-
-                if not s:
-                    raise ValueError(
-                        "Image data is required."
-                    )
-
-                if "," in s:
-                    s = s.split(
-                        ",",
-                        1
-                    )[1]
-
-                try:
-                    b = base64.b64decode(
-                        s,
-                        validate=True,
-                    )
-                except Exception:
-                    raise ValueError(
-                        "Invalid image data."
-                    )
-
-                if len(b) > MAX_UPLOAD_BYTES:
-                    raise ValueError(
-                        "Image too large."
-                    )
-
-                i = save_image(
-                    str(
-                        d.get(
-                            "filename",
-                            "image.jpg",
-                        )
-                    ),
-                    str(
-                        d.get(
-                            "mime_type",
-                            "image/jpeg",
-                        )
-                    ),
-                    b,
-                )
-
-                return json_out(
-                    self,
-                    {
-                        "message":
-                            "Image uploaded successfully.",
-                        "id": i,
-                    },
-                )
-
-            # ------------------------------------------------
-            # DATASET DELETE
-            # ------------------------------------------------
-
-            if p == "/api/dataset/delete":
-                i = int(
-                    self.body_json()["id"]
-                )
-
-                ok = delete_image(i)
-
-                return json_out(
-                    self,
-                    (
-                        {
-                            "message":
-                                "Image deleted successfully."
-                        }
-                        if ok
-                        else
-                        {
-                            "error":
-                                "Image not found."
-                        }
-                    ),
-                    200
-                    if ok
-                    else 404,
-                )
-
-            # ------------------------------------------------
-            # ANNOTATIONS
-            # ------------------------------------------------
-
-            if p == "/api/dataset/annotations":
-                d = self.body_json()
-
-                save_annotations(
-                    int(
-                        d["image_id"]
-                    ),
-                    d.get(
-                        "annotations",
-                        []
-                    ),
-                )
-
-                return json_out(
-                    self,
-                    {
-                        "message":
-                            "Annotations saved successfully."
-                    },
-                )
-
-            # ------------------------------------------------
-            # START TRAINING
-            # ------------------------------------------------
-
-            if p == "/api/training/start":
-                run_id = (
-                    start_training_request()
-                )
-
-                if not run_id:
-                    return error_out(
-                        self,
-                        (
-                            "Training is already running. "
-                            "Wait for the current run to finish."
-                        ),
-                        409,
-                    )
-
-                return json_out(
-                    self,
-                    {
-                        "message":
-                            "Training started.",
-                        "run_id":
-                            run_id,
-                    },
-                    202,
-                )
-
-            return error_out(
-                self,
-                "Not found.",
-                404,
-            )
-
-        except json.JSONDecodeError:
-            return error_out(
-                self,
-                "Invalid JSON.",
-                400,
-            )
-
-        except ValueError as e:
-            return error_out(
-                self,
-                e,
-                400,
-            )
-
-        except Exception as e:
-            traceback.print_exc()
-
-            return error_out(
-                self,
-                e,
-                500,
-            )
-
+        return error_out(self, "Not found", 404)
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    print("=" * 60)
-    print("NEERIKA BUCKET AI")
-    print("Starting server...")
-    print("=" * 60)
-
     if DATABASE_URL:
-
-        try:
-            init_db()
-
-            print(
-                "Database initialized."
-            )
-
-            try:
-                column_type = (
-                    refresh_daily_counts_column_type()
-                )
-
-                print(
-                    "daily_counts.count_date type:",
-                    column_type,
-                )
-
-            except Exception:
-                traceback.print_exc()
-
-            mark_interrupted_on_startup()
-
-        except Exception:
-            traceback.print_exc()
-
-    else:
-        print(
-            "WARNING: DATABASE_URL "
-            "is not configured."
-        )
-
-    try:
-        load_model()
-    except Exception:
-        traceback.print_exc()
-
-    server = ThreadingHTTPServer(
-        (
-            HOST,
-            PORT,
-        ),
-        Handler,
-    )
-
-    print(
-        "Running on port",
-        PORT,
-    )
-
-    print(
-        "NEERIKA BUCKET AI READY"
-    )
-
+        try: init_db()
+        except: traceback.print_exc()
+    load_model()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print("Server running on port", PORT)
     server.serve_forever()
-
-
-# ============================================================
-# START APPLICATION
-# ============================================================
 
 if __name__ == "__main__":
     main()
