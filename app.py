@@ -9,9 +9,16 @@ import shutil
 import threading
 import time
 import uuid
+import random
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ============================================================
+# NEERIKA BUCKET AI
+# Mining Production Bucket Counter
+# Full replacement app.py
+# ============================================================
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
@@ -20,37 +27,45 @@ from psycopg2.extras import RealDictCursor
 
 try:
     from ultralytics import YOLO
+    YOLO_AVAILABLE = True
 except Exception:
-    YOLO = None
+    YOLO_AVAILABLE = False
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "8080"))
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 AI_DIR = os.path.join(BASE_DIR, "ai")
 DATASET_DIR = os.path.join(AI_DIR, "dataset")
+IMAGES_DIR = os.path.join(DATASET_DIR, "images")
+LABELS_DIR = os.path.join(DATASET_DIR, "labels")
 
-TRAIN_IMAGES_DIR = os.path.join(DATASET_DIR, "images", "train")
-VAL_IMAGES_DIR = os.path.join(DATASET_DIR, "images", "val")
+TRAIN_IMAGES_DIR = os.path.join(IMAGES_DIR, "train")
+VAL_IMAGES_DIR = os.path.join(IMAGES_DIR, "val")
 
-TRAIN_LABELS_DIR = os.path.join(DATASET_DIR, "labels", "train")
-VAL_LABELS_DIR = os.path.join(DATASET_DIR, "labels", "val")
+TRAIN_LABELS_DIR = os.path.join(LABELS_DIR, "train")
+VAL_LABELS_DIR = os.path.join(LABELS_DIR, "val")
 
-RUNS_DIR = os.path.join(AI_DIR, "runs")
-MODEL_DIR = os.path.join(AI_DIR, "models")
-
-MODEL_PATH = os.path.join(MODEL_DIR, "bucket_best.pt")
-DATASET_YAML = os.path.join(DATASET_DIR, "dataset.yaml")
+MODELS_DIR = os.path.join(AI_DIR, "models")
 
 REFERENCE_DIR = os.path.join(BASE_DIR, "bucket_images")
 
-MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+MODEL_OUTPUT = os.path.join(MODELS_DIR, "bucket_best.pt")
+
+DATASET_YAML = os.path.join(AI_DIR, "bucket_dataset.yaml")
+
+EPOCHS = int(os.environ.get("YOLO_EPOCHS", "20"))
+
+IMG_SIZE = int(os.environ.get("YOLO_IMG_SIZE", "640"))
+
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "15"))
 
 
 # ============================================================
@@ -60,12 +75,13 @@ MAX_UPLOAD_SIZE = 25 * 1024 * 1024
 for folder in [
     AI_DIR,
     DATASET_DIR,
+    IMAGES_DIR,
+    LABELS_DIR,
     TRAIN_IMAGES_DIR,
     VAL_IMAGES_DIR,
     TRAIN_LABELS_DIR,
     VAL_LABELS_DIR,
-    RUNS_DIR,
-    MODEL_DIR,
+    MODELS_DIR,
     REFERENCE_DIR,
 ]:
     os.makedirs(folder, exist_ok=True)
@@ -80,13 +96,14 @@ TRAINING_STATE = {
     "message": "Ready",
     "progress": 0,
     "epoch": 0,
-    "epochs": 0,
+    "epochs": EPOCHS,
+    "error": "",
+    "model": "",
     "started_at": None,
     "finished_at": None,
-    "error": None,
 }
 
-TRAIN_LOCK = threading.Lock()
+TRAINING_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -95,41 +112,36 @@ TRAIN_LOCK = threading.Lock()
 
 def get_db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured.")
+        raise RuntimeError("DATABASE_URL environment variable is missing.")
 
     return psycopg2.connect(
         DATABASE_URL,
-        cursor_factory=RealDictCursor,
+        sslmode="require",
         connect_timeout=15
     )
 
 
-def init_database():
-    if not DATABASE_URL:
-        print("WARNING: DATABASE_URL is not configured.")
-        return
-
+def init_db():
     conn = None
 
     try:
         conn = get_db()
 
         with conn.cursor() as cur:
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bucket_counts (
                     id BIGSERIAL PRIMARY KEY,
                     bucket_count INTEGER NOT NULL DEFAULT 0,
-                    count_date TEXT,
-                    shift TEXT,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
+                    shift_name TEXT,
+                    recorded_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
 
         conn.commit()
-        print("Database initialized.")
 
     except Exception:
-        print("DATABASE INITIALIZATION ERROR")
+        print("DATABASE INIT ERROR")
         traceback.print_exc()
 
     finally:
@@ -137,58 +149,81 @@ def init_database():
             conn.close()
 
 
-def save_bucket_count(count_value, shift="A"):
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def save_bucket_count(count, shift_name=""):
     conn = None
 
     try:
         conn = get_db()
 
-        today = datetime.now().strftime("%Y-%m-%d")
-
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO bucket_counts
-                (bucket_count, count_date, shift)
-                VALUES (%s, %s, %s)
-            """, (
-                int(count_value),
-                today,
-                shift
-            ))
+                (bucket_count, shift_name)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                (int(count), shift_name)
+            )
+
+            row = cur.fetchone()
 
         conn.commit()
 
-        return True
+        return {
+            "success": True,
+            "id": row[0] if row else None
+        }
 
-    except Exception:
-        traceback.print_exc()
-        return False
+    except Exception as e:
+        if conn:
+            conn.rollback()
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
     finally:
         if conn:
             conn.close()
 
 
-def get_history(limit=200):
+def get_bucket_history():
     conn = None
 
     try:
         conn = get_db()
 
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT
                     id,
                     bucket_count,
-                    count_date,
-                    shift,
-                    created_at
+                    shift_name,
+                    recorded_at
                 FROM bucket_counts
-                ORDER BY id DESC
-                LIMIT %s
-            """, (limit,))
+                ORDER BY recorded_at DESC
+                LIMIT 500
+            """)
 
-            return cur.fetchall()
+            rows = cur.fetchall()
+
+        result = []
+
+        for row in rows:
+            item = dict(row)
+
+            if item.get("recorded_at"):
+                item["recorded_at"] = item["recorded_at"].isoformat()
+
+            result.append(item)
+
+        return result
 
     except Exception:
         traceback.print_exc()
@@ -199,56 +234,20 @@ def get_history(limit=200):
             conn.close()
 
 
-def get_dashboard_data():
-    conn = None
-
-    try:
-        conn = get_db()
-
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    COALESCE(SUM(bucket_count), 0) AS total
-                FROM bucket_counts
-            """)
-
-            total_row = cur.fetchone()
-
-            cur.execute("""
-                SELECT
-                    COALESCE(SUM(bucket_count), 0) AS today
-                FROM bucket_counts
-                WHERE count_date = %s
-            """, (
-                datetime.now().strftime("%Y-%m-%d"),
-            ))
-
-            today_row = cur.fetchone()
-
-        return {
-            "total": int(total_row["total"] or 0),
-            "today": int(today_row["today"] or 0),
-        }
-
-    except Exception:
-        traceback.print_exc()
-
-        return {
-            "total": 0,
-            "today": 0,
-        }
-
-    finally:
-        if conn:
-            conn.close()
-
-
 # ============================================================
 # FILE HELPERS
 # ============================================================
 
-def safe_filename(filename):
-    filename = os.path.basename(filename or "")
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp"
+}
+
+
+def safe_filename(name):
+    name = os.path.basename(name or "")
 
     allowed = (
         "abcdefghijklmnopqrstuvwxyz"
@@ -259,225 +258,99 @@ def safe_filename(filename):
 
     cleaned = "".join(
         c if c in allowed else "_"
-        for c in filename
+        for c in name
     )
 
     if not cleaned:
-        cleaned = "file"
+        cleaned = "image.jpg"
 
     return cleaned
 
 
-def unique_filename(filename):
-    filename = safe_filename(filename)
+def unique_filename(original):
+    original = safe_filename(original)
 
-    name, ext = os.path.splitext(filename)
+    root, ext = os.path.splitext(original)
+
+    if not ext:
+        ext = ".jpg"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique_id = uuid.uuid4().hex[:8]
 
-    return f"{name}_{timestamp}_{unique_id}{ext.lower()}"
+    random_part = uuid.uuid4().hex[:8]
 
-
-def is_image(filename):
-    return filename.lower().endswith(
-        (".jpg", ".jpeg", ".png", ".webp")
-    )
+    return f"{root}_{timestamp}_{random_part}{ext.lower()}"
 
 
-def content_type_for(filename):
-    ext = os.path.splitext(filename.lower())[1]
-
-    mapping = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-        ".css": "text/css",
-        ".js": "application/javascript",
-        ".json": "application/json",
-        ".txt": "text/plain",
-        ".csv": "text/csv",
-    }
-
-    return mapping.get(ext, "application/octet-stream")
+def is_image_file(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ALLOWED_IMAGE_EXTENSIONS
 
 
 # ============================================================
-# DATASET HELPERS
-# ============================================================
-
-def get_split_dirs(split):
-    if split == "val":
-        return VAL_IMAGES_DIR, VAL_LABELS_DIR
-
-    return TRAIN_IMAGES_DIR, TRAIN_LABELS_DIR
-
-
-def get_dataset_yaml():
-    content = f"""path: {DATASET_DIR}
-train: images/train
-val: images/val
-
-names:
-  0: BUCKET_LOADED
-"""
-
-    with open(DATASET_YAML, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    return DATASET_YAML
-
-
-def dataset_stats():
-    result = {
-        "training_images": 0,
-        "validation_images": 0,
-        "training_labels": 0,
-        "validation_labels": 0,
-        "training_unlabeled": 0,
-        "validation_unlabeled": 0,
-    }
-
-    train_images = [
-        f for f in os.listdir(TRAIN_IMAGES_DIR)
-        if is_image(f)
-    ]
-
-    val_images = [
-        f for f in os.listdir(VAL_IMAGES_DIR)
-        if is_image(f)
-    ]
-
-    train_labels = [
-        f for f in os.listdir(TRAIN_LABELS_DIR)
-        if f.lower().endswith(".txt")
-    ]
-
-    val_labels = [
-        f for f in os.listdir(VAL_LABELS_DIR)
-        if f.lower().endswith(".txt")
-    ]
-
-    result["training_images"] = len(train_images)
-    result["validation_images"] = len(val_images)
-    result["training_labels"] = len(train_labels)
-    result["validation_labels"] = len(val_labels)
-
-    train_unlabeled = 0
-
-    for image in train_images:
-        base = os.path.splitext(image)[0]
-        label = base + ".txt"
-
-        if not os.path.exists(
-            os.path.join(TRAIN_LABELS_DIR, label)
-        ):
-            train_unlabeled += 1
-
-    val_unlabeled = 0
-
-    for image in val_images:
-        base = os.path.splitext(image)[0]
-        label = base + ".txt"
-
-        if not os.path.exists(
-            os.path.join(VAL_LABELS_DIR, label)
-        ):
-            val_unlabeled += 1
-
-    result["training_unlabeled"] = train_unlabeled
-    result["validation_unlabeled"] = val_unlabeled
-
-    return result
-
-
-def dataset_image_list(split="train"):
-    images_dir, labels_dir = get_split_dirs(split)
-
-    result = []
-
-    if not os.path.exists(images_dir):
-        return result
-
-    for filename in sorted(os.listdir(images_dir)):
-        if not is_image(filename):
-            continue
-
-        label_filename = (
-            os.path.splitext(filename)[0] + ".txt"
-        )
-
-        label_exists = os.path.exists(
-            os.path.join(labels_dir, label_filename)
-        )
-
-        result.append({
-            "filename": filename,
-            "split": split,
-            "label_exists": label_exists,
-            "url": f"/dataset/{split}/{filename}",
-        })
-
-    return result
-
-
-# ============================================================
-# MULTIPART UPLOAD PARSER
+# MULTIPART PARSER
 # ============================================================
 
 def parse_multipart(handler):
     content_type = handler.headers.get("Content-Type", "")
 
     if "multipart/form-data" not in content_type:
-        raise ValueError("Expected multipart/form-data")
+        raise ValueError("Expected multipart/form-data.")
 
-    if "boundary=" not in content_type:
-        raise ValueError("Multipart boundary missing")
+    content_length = int(handler.headers.get("Content-Length", "0"))
 
-    boundary = content_type.split("boundary=", 1)[1]
+    if content_length <= 0:
+        raise ValueError("Empty upload.")
 
-    boundary = boundary.strip()
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
 
-    if boundary.startswith('"') and boundary.endswith('"'):
-        boundary = boundary[1:-1]
-
-    boundary_bytes = ("--" + boundary).encode()
-
-    content_length = int(
-        handler.headers.get("Content-Length", "0")
-    )
-
-    if content_length > MAX_UPLOAD_SIZE:
+    if content_length > max_bytes:
         raise ValueError(
-            "File is too large. Maximum upload size is 25 MB."
+            f"File too large. Maximum is {MAX_UPLOAD_MB} MB."
         )
 
     body = handler.rfile.read(content_length)
 
+    boundary_marker = "boundary="
+
+    if boundary_marker not in content_type:
+        raise ValueError("Multipart boundary missing.")
+
+    boundary = content_type.split(
+        boundary_marker,
+        1
+    )[1].strip()
+
+    if boundary.startswith('"') and boundary.endswith('"'):
+        boundary = boundary[1:-1]
+
+    boundary_bytes = (
+        b"--" +
+        boundary.encode("utf-8")
+    )
+
     parts = body.split(boundary_bytes)
+
+    fields = {}
 
     files = []
 
     for part in parts:
-        if not part or part in (b"--\r\n", b"--"):
+
+        part = part.strip(b"\r\n-")
+
+        if not part:
             continue
 
-        part = part.strip(b"\r\n")
+        header_end = part.find(b"\r\n\r\n")
 
-        if b"\r\n\r\n" not in part:
+        if header_end == -1:
             continue
 
-        header_block, data = part.split(
-            b"\r\n\r\n",
-            1
-        )
+        header_bytes = part[:header_end]
+        data = part[header_end + 4:]
 
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
-
-        headers = header_block.decode(
+        headers = header_bytes.decode(
             "utf-8",
             errors="ignore"
         )
@@ -485,248 +358,513 @@ def parse_multipart(handler):
         disposition = ""
 
         for line in headers.split("\r\n"):
-            if line.lower().startswith("content-disposition:"):
+            if line.lower().startswith(
+                "content-disposition:"
+            ):
                 disposition = line
-                break
 
-        if not disposition:
-            continue
-
-        filename = None
         field_name = None
+        filename = None
 
-        if 'name="' in disposition:
-            field_name = disposition.split(
-                'name="',
-                1
-            )[1].split('"', 1)[0]
+        for token in disposition.split(";"):
 
-        if 'filename="' in disposition:
-            filename = disposition.split(
-                'filename="',
-                1
-            )[1].split('"', 1)[0]
+            token = token.strip()
+
+            if token.startswith("name="):
+                field_name = token.split(
+                    "=",
+                    1
+                )[1].strip('"')
+
+            elif token.startswith("filename="):
+                filename = token.split(
+                    "=",
+                    1
+                )[1].strip('"')
+
+        if not field_name:
+            continue
 
         if filename:
             files.append({
                 "field": field_name,
                 "filename": filename,
-                "data": data,
+                "data": data
             })
 
-    return files
+        else:
+            fields[field_name] = data.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+    return fields, files
 
 
 # ============================================================
-# SAVE YOLO LABELS
+# DATASET HELPERS
 # ============================================================
 
-def save_yolo_labels(image_filename, boxes, split="train"):
+def split_dirs(split):
     split = "val" if split == "val" else "train"
 
-    image_filename = safe_filename(image_filename)
+    if split == "val":
+        return VAL_IMAGES_DIR, VAL_LABELS_DIR
 
-    images_dir, labels_dir = get_split_dirs(split)
+    return TRAIN_IMAGES_DIR, TRAIN_LABELS_DIR
 
-    image_path = os.path.join(
-        images_dir,
-        image_filename
+
+def write_dataset_yaml():
+
+    content = f"""path: {DATASET_DIR.replace(os.sep, "/")}
+train: images/train
+val: images/val
+
+names:
+  0: BUCKET_LOADED
+"""
+
+    with open(
+        DATASET_YAML,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.write(content)
+
+
+def image_files_in(directory):
+    result = []
+
+    if not os.path.isdir(directory):
+        return result
+
+    for name in sorted(os.listdir(directory)):
+
+        path = os.path.join(directory, name)
+
+        if not os.path.isfile(path):
+            continue
+
+        if is_image_file(name):
+            result.append(name)
+
+    return result
+
+
+def label_path_for(split, filename):
+    image_dir, label_dir = split_dirs(split)
+
+    root = os.path.splitext(
+        safe_filename(filename)
+    )[0]
+
+    return os.path.join(
+        label_dir,
+        root + ".txt"
     )
 
-    if not os.path.isfile(image_path):
-        raise ValueError(
-            "Dataset image was not found."
+
+def image_path_for(split, filename):
+    image_dir, label_dir = split_dirs(split)
+
+    return os.path.join(
+        image_dir,
+        safe_filename(filename)
+    )
+
+
+def image_has_label(split, filename):
+
+    path = label_path_for(
+        split,
+        filename
+    )
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            content = f.read().strip()
+
+        return bool(content)
+
+    except Exception:
+        return False
+
+
+def dataset_stats():
+
+    train_images = image_files_in(
+        TRAIN_IMAGES_DIR
+    )
+
+    val_images = image_files_in(
+        VAL_IMAGES_DIR
+    )
+
+    train_labels = 0
+    val_labels = 0
+
+    for filename in train_images:
+        if image_has_label("train", filename):
+            train_labels += 1
+
+    for filename in val_images:
+        if image_has_label("val", filename):
+            val_labels += 1
+
+    return {
+        "training_images": len(train_images),
+        "validation_images": len(val_images),
+        "training_labels": train_labels,
+        "validation_labels": val_labels,
+        "unlabeled_training": (
+            len(train_images) - train_labels
+        ),
+        "unlabeled_validation": (
+            len(val_images) - val_labels
         )
+    }
 
-    if not isinstance(boxes, list):
-        raise ValueError("boxes must be a list")
 
-    if len(boxes) == 0:
-        raise ValueError(
-            "At least one bucket box is required."
-        )
+# ============================================================
+# YOLO LABEL HELPERS
+# ============================================================
 
-    if len(boxes) > 100:
-        raise ValueError(
-            "Maximum 100 boxes per image."
-        )
+def save_yolo_labels(
+    split,
+    filename,
+    boxes
+):
 
-    lines = []
+    split = "val" if split == "val" else "train"
+
+    label_path = label_path_for(
+        split,
+        filename
+    )
+
+    valid_lines = []
 
     for box in boxes:
 
         try:
-            x_center = float(box["x_center"])
-            y_center = float(box["y_center"])
-            width = float(box["width"])
-            height = float(box["height"])
+            x = float(box["x"])
+            y = float(box["y"])
+            w = float(box["w"])
+            h = float(box["h"])
+
+            if w <= 0 or h <= 0:
+                continue
+
+            # YOLO normalized coordinates
+            valid_lines.append(
+                f"0 {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
+            )
+
         except Exception:
-            raise ValueError(
-                "Invalid bounding box values."
-            )
+            continue
 
-        if not (
-            0 <= x_center <= 1
-            and
-            0 <= y_center <= 1
-            and
-            0 < width <= 1
-            and
-            0 < height <= 1
-        ):
-            raise ValueError(
-                "Bounding box coordinates must be between 0 and 1."
-            )
-
-        lines.append(
-            "0 "
-            f"{x_center:.6f} "
-            f"{y_center:.6f} "
-            f"{width:.6f} "
-            f"{height:.6f}"
+    if not valid_lines:
+        raise ValueError(
+            "No valid annotation boxes."
         )
-
-    label_filename = (
-        os.path.splitext(image_filename)[0]
-        + ".txt"
-    )
-
-    label_path = os.path.join(
-        labels_dir,
-        label_filename
-    )
 
     with open(
         label_path,
         "w",
         encoding="utf-8"
     ) as f:
+
         f.write(
-            "\n".join(lines) + "\n"
+            "\n".join(valid_lines) +
+            "\n"
         )
 
-    return label_filename
+    return {
+        "filename": os.path.basename(
+            label_path
+        ),
+        "boxes": len(valid_lines)
+    }
+
+
+def read_yolo_labels(
+    split,
+    filename
+):
+
+    path = label_path_for(
+        split,
+        filename
+    )
+
+    if not os.path.exists(path):
+        return []
+
+    result = []
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            lines = f.readlines()
+
+        for line in lines:
+
+            parts = line.strip().split()
+
+            if len(parts) != 5:
+                continue
+
+            try:
+
+                cls = int(parts[0])
+
+                x = float(parts[1])
+                y = float(parts[2])
+                w = float(parts[3])
+                h = float(parts[4])
+
+                result.append({
+                    "class_id": cls,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h
+                })
+
+            except Exception:
+                continue
+
+    except Exception:
+        traceback.print_exc()
+
+    return result
 
 
 # ============================================================
-# VALIDATION DATA
+# VALIDATION DATA PREPARATION
 # ============================================================
 
 def prepare_validation_data():
-    train_images = [
-        f for f in os.listdir(TRAIN_IMAGES_DIR)
-        if is_image(f)
+
+    val_images = image_files_in(
+        VAL_IMAGES_DIR
+    )
+
+    val_labeled = [
+        name
+        for name in val_images
+        if image_has_label(
+            "val",
+            name
+        )
     ]
 
-    val_images = [
-        f for f in os.listdir(VAL_IMAGES_DIR)
-        if is_image(f)
+    if val_labeled:
+        return {
+            "created": False,
+            "filename": val_labeled[0]
+        }
+
+    train_images = image_files_in(
+        TRAIN_IMAGES_DIR
+    )
+
+    train_labeled = [
+        name
+        for name in train_images
+        if image_has_label(
+            "train",
+            name
+        )
     ]
 
-    if val_images:
-        return
-
-    labeled_train = []
-
-    for image in train_images:
-        label = os.path.splitext(image)[0] + ".txt"
-
-        if os.path.exists(
-            os.path.join(TRAIN_LABELS_DIR, label)
-        ):
-            labeled_train.append(image)
-
-    if not labeled_train:
+    if not train_labeled:
         raise RuntimeError(
-            "No labeled training images found. "
-            "Draw a bucket box and save the YOLO label first."
+            "No labeled training images found."
         )
 
-    # For a small test dataset, copy one labeled image
-    # to validation when validation is empty.
-    source_image = labeled_train[-1]
+    # If validation is empty, copy one labeled
+    # training image to validation as a pipeline
+    # fallback.
+    source_name = train_labeled[0]
 
-    source_label = (
-        os.path.splitext(source_image)[0] + ".txt"
+    source_image = os.path.join(
+        TRAIN_IMAGES_DIR,
+        source_name
+    )
+
+    source_label = os.path.join(
+        TRAIN_LABELS_DIR,
+        os.path.splitext(
+            source_name
+        )[0] + ".txt"
+    )
+
+    val_name = (
+        "validation_" +
+        source_name
+    )
+
+    destination_image = os.path.join(
+        VAL_IMAGES_DIR,
+        val_name
+    )
+
+    destination_label = os.path.join(
+        VAL_LABELS_DIR,
+        os.path.splitext(
+            val_name
+        )[0] + ".txt"
     )
 
     shutil.copy2(
-        os.path.join(TRAIN_IMAGES_DIR, source_image),
-        os.path.join(VAL_IMAGES_DIR, source_image)
+        source_image,
+        destination_image
     )
 
     shutil.copy2(
-        os.path.join(TRAIN_LABELS_DIR, source_label),
-        os.path.join(VAL_LABELS_DIR, source_label)
+        source_label,
+        destination_label
     )
 
-
-# ============================================================
-# MODEL
-# ============================================================
-
-def trained_model_exists():
-    return os.path.isfile(MODEL_PATH)
-
-
-def load_detection_model():
-    if YOLO is None:
-        raise RuntimeError(
-            "Ultralytics is not installed."
-        )
-
-    if not os.path.isfile(MODEL_PATH):
-        raise RuntimeError(
-            "Trained bucket model does not exist yet. "
-            "Upload and annotate training images, then train the model."
-        )
-
-    return YOLO(MODEL_PATH)
+    return {
+        "created": True,
+        "filename": val_name
+    }
 
 
 # ============================================================
-# TRAINING
+# TRAINING CALLBACK
 # ============================================================
+
+def update_training_state(
+    status=None,
+    message=None,
+    progress=None,
+    epoch=None,
+    error=None
+):
+
+    with TRAINING_LOCK:
+
+        if status is not None:
+            TRAINING_STATE["status"] = status
+
+        if message is not None:
+            TRAINING_STATE["message"] = message
+
+        if progress is not None:
+            TRAINING_STATE["progress"] = max(
+                0,
+                min(
+                    100,
+                    int(progress)
+                )
+            )
+
+        if epoch is not None:
+            TRAINING_STATE["epoch"] = epoch
+
+        if error is not None:
+            TRAINING_STATE["error"] = error
+
+
+def reset_training_state():
+
+    with TRAINING_LOCK:
+
+        TRAINING_STATE.update({
+            "status": "idle",
+            "message": "Ready",
+            "progress": 0,
+            "epoch": 0,
+            "epochs": EPOCHS,
+            "error": "",
+            "model": "",
+            "started_at": None,
+            "finished_at": None,
+        })
+
 
 def training_callback(trainer):
+
     try:
+
         epoch = int(
-            getattr(trainer, "epoch", 0)
+            getattr(
+                trainer,
+                "epoch",
+                0
+            )
         )
 
         total_epochs = int(
             getattr(
                 trainer,
                 "epochs",
-                TRAINING_STATE["epochs"] or 1
+                EPOCHS
             )
         )
 
-        TRAINING_STATE["epoch"] = epoch + 1
-        TRAINING_STATE["epochs"] = total_epochs
+        # epoch is zero based
+        completed = epoch + 1
 
-        if total_epochs > 0:
-            TRAINING_STATE["progress"] = int(
-                ((epoch + 1) / total_epochs) * 100
-            )
+        progress = int(
+            completed /
+            max(1, total_epochs)
+            * 100
+        )
 
-        TRAINING_STATE["message"] = (
-            f"Training YOLO... "
-            f"Epoch {epoch + 1}/{total_epochs}"
+        update_training_state(
+            status="training",
+            message=(
+                f"Training YOLO: "
+                f"Epoch {completed}/{total_epochs}"
+            ),
+            progress=progress,
+            epoch=completed
+        )
+
+        print(
+            f"YOLO TRAINING: "
+            f"Epoch {completed}/{total_epochs} "
+            f"({progress}%)"
         )
 
     except Exception:
-        pass
+
+        traceback.print_exc()
 
 
-def train_model():
+# ============================================================
+# TRAIN YOLO
+# ============================================================
+
+def train_yolo_worker():
+
     try:
-        TRAINING_STATE["status"] = "training"
-        TRAINING_STATE["message"] = "Preparing dataset..."
-        TRAINING_STATE["progress"] = 0
-        TRAINING_STATE["error"] = None
-        TRAINING_STATE["started_at"] = datetime.now().isoformat()
-        TRAINING_STATE["finished_at"] = None
+
+        update_training_state(
+            status="preparing",
+            message="Preparing dataset...",
+            progress=1,
+            epoch=0
+        )
+
+        write_dataset_yaml()
 
         stats = dataset_stats()
 
@@ -737,215 +875,411 @@ def train_model():
 
         if stats["training_labels"] == 0:
             raise RuntimeError(
-                "No training labels found. "
-                "Open an image in Training and draw a box around the loaded bucket."
+                "No labeled training images found. "
+                "Annotate at least one image first."
             )
 
-        if stats["training_unlabeled"] > 0:
-            raise RuntimeError(
-                f"{stats['training_unlabeled']} training image(s) "
-                "do not have labels. Annotate every training image first."
-            )
+        update_training_state(
+            status="preparing",
+            message=(
+                f"Dataset ready: "
+                f"{stats['training_labels']} "
+                f"labeled training image(s)."
+            ),
+            progress=5
+        )
 
+        # Prepare validation
         prepare_validation_data()
 
-        get_dataset_yaml()
+        write_dataset_yaml()
 
-        stats = dataset_stats()
-
-        TRAINING_STATE["epochs"] = 20
-        TRAINING_STATE["message"] = (
-            "Loading YOLO model..."
+        update_training_state(
+            status="preparing",
+            message="Validation dataset ready.",
+            progress=8
         )
 
-        if YOLO is None:
+        if not YOLO_AVAILABLE:
             raise RuntimeError(
-                "Ultralytics package is not available."
+                "Ultralytics YOLO is not installed. "
+                "Add ultralytics to requirements.txt."
             )
 
-        if os.path.isfile(MODEL_PATH):
-            model = YOLO(MODEL_PATH)
+        update_training_state(
+            status="loading_model",
+            message="Loading YOLO model...",
+            progress=10
+        )
+
+        # Prefer previously trained model.
+        # Otherwise use YOLO11 nano.
+        if os.path.exists(MODEL_OUTPUT):
+            model_source = MODEL_OUTPUT
         else:
-            # Ultralytics can download the base model
-            # when internet access is available.
-            model = YOLO("yolo11n.pt")
+            model_source = "yolo11n.pt"
 
-        model.add_callback(
-            "on_train_epoch_end",
-            training_callback
+        print(
+            "Loading YOLO model:",
+            model_source
         )
 
-        TRAINING_STATE["message"] = (
-            "Starting YOLO training..."
+        model = YOLO(model_source)
+
+        # Register callback
+        try:
+            model.add_callback(
+                "on_fit_epoch_end",
+                training_callback
+            )
+        except Exception:
+            try:
+                model.add_callback(
+                    "on_train_epoch_end",
+                    training_callback
+                )
+            except Exception:
+                traceback.print_exc()
+
+        update_training_state(
+            status="training",
+            message=(
+                f"Training YOLO for "
+                f"{EPOCHS} epochs..."
+            ),
+            progress=12,
+            epoch=0
         )
 
-        run_name = (
-            "bucket_training_"
-            + datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
+        print("STARTING YOLO TRAINING")
 
-        model.train(
-            data=get_dataset_yaml(),
-            epochs=20,
-            imgsz=640,
-            batch=4,
-            workers=0,
-            project=RUNS_DIR,
-            name=run_name,
+        results = model.train(
+            data=DATASET_YAML,
+            epochs=EPOCHS,
+            imgsz=IMG_SIZE,
+            project=AI_DIR,
+            name="bucket_training",
             exist_ok=True,
-            pretrained=True,
-            verbose=True,
+            verbose=True
         )
 
-        best_path = os.path.join(
-            RUNS_DIR,
-            run_name,
-            "weights",
-            "best.pt"
+        update_training_state(
+            status="saving",
+            message="Training finished. Saving best model...",
+            progress=95,
+            epoch=EPOCHS
         )
 
-        if not os.path.isfile(best_path):
-            raise RuntimeError(
-                "Training finished but best.pt was not found."
+        # Locate best.pt
+        possible_best = []
+
+        try:
+            save_dir = getattr(
+                results,
+                "save_dir",
+                None
             )
 
-        shutil.copy2(
-            best_path,
-            MODEL_PATH
-        )
+            if save_dir:
+                possible_best.append(
+                    os.path.join(
+                        str(save_dir),
+                        "weights",
+                        "best.pt"
+                    )
+                )
+        except Exception:
+            pass
 
-        TRAINING_STATE["status"] = "completed"
-        TRAINING_STATE["progress"] = 100
-        TRAINING_STATE["message"] = (
-            "Training completed successfully. "
-            "bucket_best.pt is ready."
-        )
-        TRAINING_STATE["finished_at"] = (
-            datetime.now().isoformat()
-        )
+        possible_best.extend([
+            os.path.join(
+                AI_DIR,
+                "bucket_training",
+                "weights",
+                "best.pt"
+            ),
+            os.path.join(
+                AI_DIR,
+                "runs",
+                "detect",
+                "bucket_training",
+                "weights",
+                "best.pt"
+            ),
+            os.path.join(
+                AI_DIR,
+                "runs",
+                "train",
+                "bucket_training",
+                "weights",
+                "best.pt"
+            )
+        ])
+
+        best_path = None
+
+        for candidate in possible_best:
+
+            if candidate and os.path.exists(
+                candidate
+            ):
+                best_path = candidate
+                break
+
+        if best_path:
+
+            os.makedirs(
+                MODELS_DIR,
+                exist_ok=True
+            )
+
+            shutil.copy2(
+                best_path,
+                MODEL_OUTPUT
+            )
+
+            update_training_state(
+                status="completed",
+                message=(
+                    "Training completed successfully. "
+                    "Best model saved."
+                ),
+                progress=100,
+                epoch=EPOCHS
+            )
+
+            TRAINING_STATE["model"] = MODEL_OUTPUT
+
+            print(
+                "BEST MODEL SAVED:",
+                MODEL_OUTPUT
+            )
+
+        else:
+
+            raise RuntimeError(
+                "Training completed but best.pt "
+                "was not found."
+            )
 
     except Exception as e:
 
+        error_text = str(e)
+
+        print("YOLO TRAINING ERROR")
         traceback.print_exc()
 
-        TRAINING_STATE["status"] = "error"
-        TRAINING_STATE["message"] = str(e)
-        TRAINING_STATE["error"] = str(e)
-        TRAINING_STATE["finished_at"] = (
-            datetime.now().isoformat()
+        update_training_state(
+            status="error",
+            message="Training failed.",
+            progress=0,
+            error=error_text
         )
 
     finally:
-        if TRAIN_LOCK.locked():
-            TRAIN_LOCK.release()
+
+        with TRAINING_LOCK:
+            TRAINING_STATE["finished_at"] = (
+                datetime.utcnow().isoformat()
+            )
 
 
 def start_training():
 
-    if not TRAIN_LOCK.acquire(blocking=False):
-        return {
-            "ok": False,
-            "message": "Training is already running."
-        }
+    with TRAINING_LOCK:
+
+        if TRAINING_STATE["status"] in {
+            "preparing",
+            "loading_model",
+            "training",
+            "saving"
+        }:
+
+            return {
+                "success": False,
+                "message": "Training is already running."
+            }
+
+        TRAINING_STATE.update({
+            "status": "preparing",
+            "message": "Starting YOLO training...",
+            "progress": 1,
+            "epoch": 0,
+            "epochs": EPOCHS,
+            "error": "",
+            "model": "",
+            "started_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+        })
 
     thread = threading.Thread(
-        target=train_model,
+        target=train_yolo_worker,
         daemon=True
     )
 
     thread.start()
 
     return {
-        "ok": True,
+        "success": True,
         "message": "Training started."
     }
 
 
 # ============================================================
-# DETECTION
+# MODEL DETECTION
 # ============================================================
 
-def detect_image(image_bytes):
-    if YOLO is None:
-        raise RuntimeError(
-            "Ultralytics is not installed."
-        )
+DETECTION_MODEL = None
+DETECTION_MODEL_MTIME = None
 
-    model = load_detection_model()
 
-    temp_name = (
-        f"/tmp/bucket_detect_{uuid.uuid4().hex}.jpg"
+def load_detection_model():
+
+    global DETECTION_MODEL
+    global DETECTION_MODEL_MTIME
+
+    if not YOLO_AVAILABLE:
+        return None
+
+    if not os.path.exists(
+        MODEL_OUTPUT
+    ):
+        return None
+
+    mtime = os.path.getmtime(
+        MODEL_OUTPUT
     )
 
-    try:
-
-        with open(temp_name, "wb") as f:
-            f.write(image_bytes)
-
-        results = model.predict(
-            source=temp_name,
-            conf=0.35,
-            imgsz=640,
-            verbose=False
-        )
-
-        detections = []
-
-        for result in results:
-
-            boxes = getattr(result, "boxes", None)
-
-            if boxes is None:
-                continue
-
-            for box in boxes:
-
-                try:
-                    cls_id = int(
-                        box.cls[0].item()
-                    )
-
-                    confidence = float(
-                        box.conf[0].item()
-                    )
-
-                    xyxy = (
-                        box.xyxy[0]
-                        .cpu()
-                        .numpy()
-                        .tolist()
-                    )
-
-                    x1, y1, x2, y2 = xyxy
-
-                    detections.append({
-                        "class_id": cls_id,
-                        "class_name": "BUCKET_LOADED",
-                        "confidence": round(
-                            confidence,
-                            4
-                        ),
-                        "x1": round(x1, 2),
-                        "y1": round(y1, 2),
-                        "x2": round(x2, 2),
-                        "y2": round(y2, 2),
-                    })
-
-                except Exception:
-                    continue
-
-        return {
-            "count": len(detections),
-            "detections": detections,
-        }
-
-    finally:
+    if (
+        DETECTION_MODEL is None
+        or DETECTION_MODEL_MTIME != mtime
+    ):
 
         try:
-            if os.path.exists(temp_name):
-                os.remove(temp_name)
+
+            DETECTION_MODEL = YOLO(
+                MODEL_OUTPUT
+            )
+
+            DETECTION_MODEL_MTIME = mtime
+
         except Exception:
-            pass
+
+            traceback.print_exc()
+            DETECTION_MODEL = None
+
+    return DETECTION_MODEL
+
+
+# ============================================================
+# HTTP RESPONSE HELPERS
+# ============================================================
+
+def json_bytes(data):
+
+    return json.dumps(
+        data,
+        ensure_ascii=False
+    ).encode("utf-8")
+
+
+def send_json(handler, data, status=200):
+
+    body = json_bytes(data)
+
+    handler.send_response(status)
+
+    handler.send_header(
+        "Content-Type",
+        "application/json; charset=utf-8"
+    )
+
+    handler.send_header(
+        "Content-Length",
+        str(len(body))
+    )
+
+    handler.send_header(
+        "Cache-Control",
+        "no-store"
+    )
+
+    handler.end_headers()
+
+    handler.wfile.write(body)
+
+
+def send_html(handler, html):
+
+    body = html.encode("utf-8")
+
+    handler.send_response(200)
+
+    handler.send_header(
+        "Content-Type",
+        "text/html; charset=utf-8"
+    )
+
+    handler.send_header(
+        "Content-Length",
+        str(len(body))
+    )
+
+    handler.end_headers()
+
+    handler.wfile.write(body)
+
+
+def send_file(handler, path):
+
+    if not os.path.exists(path):
+        handler.send_error(404)
+        return
+
+    ext = os.path.splitext(
+        path
+    )[1].lower()
+
+    content_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".txt": "text/plain",
+        ".yaml": "text/plain",
+    }
+
+    content_type = content_types.get(
+        ext,
+        "application/octet-stream"
+    )
+
+    with open(
+        path,
+        "rb"
+    ) as f:
+        body = f.read()
+
+    handler.send_response(200)
+
+    handler.send_header(
+        "Content-Type",
+        content_type
+    )
+
+    handler.send_header(
+        "Content-Length",
+        str(len(body))
+    )
+
+    handler.send_header(
+        "Cache-Control",
+        "no-cache"
+    )
+
+    handler.end_headers()
+
+    handler.wfile.write(body)
 
 
 # ============================================================
@@ -962,7 +1296,7 @@ HTML_PAGE = r"""
 
 <meta
     name="viewport"
-    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    content="width=device-width, initial-scale=1.0"
 >
 
 <title>NEERIKA BUCKET AI</title>
@@ -975,9 +1309,12 @@ HTML_PAGE = r"""
 
 body {
     margin: 0;
-    font-family: Arial, Helvetica, sans-serif;
-    background: #f3f4f6;
-    color: #111827;
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+    background: #f4f6f8;
+    color: #17202a;
 }
 
 header {
@@ -992,272 +1329,224 @@ header h1 {
 }
 
 header p {
-    margin: 6px 0 0;
-    color: #d1d5db;
+    margin: 5px 0 0;
+    color: #cbd5e1;
 }
 
 nav {
     display: flex;
-    overflow-x: auto;
     gap: 6px;
-    padding: 10px;
-    background: white;
-    border-bottom: 1px solid #ddd;
+    overflow-x: auto;
+    background: #1f2937;
+    padding: 8px;
 }
 
 nav button {
     border: 0;
-    background: #e5e7eb;
+    background: #374151;
+    color: white;
     padding: 10px 14px;
-    border-radius: 8px;
-    font-weight: bold;
-    white-space: nowrap;
+    border-radius: 7px;
+    cursor: pointer;
 }
 
 nav button.active {
-    background: #111827;
-    color: white;
+    background: #16a34a;
 }
 
 main {
     max-width: 1100px;
     margin: auto;
-    padding: 16px;
-}
-
-.tab {
-    display: none;
-}
-
-.tab.active {
-    display: block;
+    padding: 15px;
 }
 
 .card {
     background: white;
     border-radius: 12px;
     padding: 16px;
-    margin-bottom: 16px;
-    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    margin-bottom: 15px;
+    box-shadow:
+        0 2px 8px rgba(0,0,0,.08);
 }
 
-.card h2 {
+h2 {
     margin-top: 0;
 }
 
-.grid {
+.hidden {
+    display: none !important;
+}
+
+input,
+select,
+button {
+    font-size: 16px;
+}
+
+input,
+select {
+    width: 100%;
+    padding: 11px;
+    margin: 6px 0 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+}
+
+.btn {
+    border: 0;
+    border-radius: 7px;
+    padding: 11px 15px;
+    cursor: pointer;
+    background: #2563eb;
+    color: white;
+    margin: 3px;
+}
+
+.btn.green {
+    background: #16a34a;
+}
+
+.btn.red {
+    background: #dc2626;
+}
+
+.btn.gray {
+    background: #64748b;
+}
+
+.stats {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
+    grid-template-columns:
+        repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
 }
 
 .stat {
-    background: #111827;
-    color: white;
-    padding: 18px;
-    border-radius: 12px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 15px;
 }
 
 .stat strong {
     display: block;
-    font-size: 30px;
+    font-size: 26px;
     margin-top: 5px;
-}
-
-button,
-input,
-select {
-    font: inherit;
-}
-
-button {
-    cursor: pointer;
-}
-
-.primary {
-    background: #111827;
-    color: white;
-    border: 0;
-    padding: 11px 16px;
-    border-radius: 8px;
-    font-weight: bold;
-}
-
-.success {
-    background: #15803d;
-    color: white;
-    border: 0;
-    padding: 11px 16px;
-    border-radius: 8px;
-    font-weight: bold;
-}
-
-.danger {
-    background: #b91c1c;
-    color: white;
-    border: 0;
-    padding: 8px 12px;
-    border-radius: 7px;
-}
-
-input[type=file],
-select {
-    width: 100%;
-    padding: 10px;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    margin: 6px 0 12px;
-}
-
-.message {
-    padding: 12px;
-    border-radius: 8px;
-    margin-top: 10px;
-    background: #f3f4f6;
-}
-
-.ok {
-    background: #dcfce7;
-    color: #166534;
-}
-
-.error {
-    background: #fee2e2;
-    color: #991b1b;
-}
-
-.warning {
-    background: #fef3c7;
-    color: #92400e;
-}
-
-
-/* ========================================================
-   ANNOTATION AREA
-   ======================================================== */
-
-.annotation-stage {
-    position: relative;
-    width: 100%;
-    max-width: 950px;
-    margin: 15px auto;
-    background: #000;
-    overflow: hidden;
-    border-radius: 10px;
-
-    /*
-       VERY IMPORTANT:
-       Prevents the phone browser from scrolling
-       while the user is drawing with a finger.
-    */
-    touch-action: none;
-    user-select: none;
-    -webkit-user-select: none;
-}
-
-.annotation-stage img {
-    display: block;
-    width: 100%;
-    height: auto;
-    max-width: 100%;
-
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-user-drag: none;
-}
-
-.annotation-stage canvas {
-    position: absolute;
-    left: 0;
-    top: 0;
-
-    width: 100%;
-    height: 100%;
-
-    touch-action: none;
-    cursor: crosshair;
-
-    user-select: none;
-    -webkit-user-select: none;
-}
-
-.annotation-help {
-    background: #eef2ff;
-    border-left: 4px solid #4f46e5;
-    padding: 12px;
-    border-radius: 8px;
-    margin: 10px 0;
-}
-
-.annotation-buttons {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 10px;
-}
-
-.box-list {
-    margin-top: 12px;
-}
-
-.box-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 9px;
-    background: #f3f4f6;
-    border-radius: 7px;
-    margin-bottom: 6px;
 }
 
 .dataset-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    grid-template-columns:
+        repeat(auto-fit, minmax(250px, 1fr));
     gap: 12px;
 }
 
-.dataset-item {
-    border: 1px solid #ddd;
+.image-card {
+    border: 1px solid #dbe2ea;
     border-radius: 10px;
-    overflow: hidden;
+    padding: 10px;
     background: white;
 }
 
-.dataset-item img {
+.image-card img {
     width: 100%;
-    height: 140px;
-    object-fit: cover;
-    display: block;
+    max-height: 220px;
+    object-fit: contain;
+    background: #111827;
+    border-radius: 7px;
 }
 
-.dataset-item-body {
-    padding: 10px;
-}
-
-.dataset-name {
-    font-size: 12px;
+.filename {
+    font-size: 13px;
     word-break: break-all;
-    margin-bottom: 7px;
+    margin: 7px 0;
 }
 
 .badge {
     display: inline-block;
-    padding: 4px 7px;
-    border-radius: 6px;
-    font-size: 11px;
+    padding: 5px 8px;
+    border-radius: 20px;
+    font-size: 12px;
     font-weight: bold;
-    margin-bottom: 8px;
 }
 
-.badge.ok {
+.badge.green {
     background: #dcfce7;
     color: #166534;
 }
 
-.badge.warning {
-    background: #fef3c7;
-    color: #92400e;
+.badge.orange {
+    background: #ffedd5;
+    color: #9a3412;
+}
+
+#annotationCanvas {
+    width: 100%;
+    max-width: 900px;
+    display: block;
+    margin: auto;
+    background: #111;
+    border-radius: 8px;
+    touch-action: none;
+    cursor: crosshair;
+}
+
+.annotation-info {
+    padding: 10px;
+    background: #f1f5f9;
+    border-radius: 8px;
+    margin-bottom: 10px;
+}
+
+.progress-box {
+    margin-top: 10px;
+}
+
+.progress-track {
+    width: 100%;
+    height: 25px;
+    background: #e5e7eb;
+    border-radius: 20px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    width: 0%;
+    height: 100%;
+    background: #16a34a;
+    transition: width .3s ease;
+    text-align: center;
+    color: white;
+    font-weight: bold;
+    line-height: 25px;
+}
+
+.status {
+    padding: 12px;
+    border-radius: 8px;
+    background: #f1f5f9;
+    margin-top: 10px;
+    word-break: break-word;
+}
+
+.status.training {
+    background: #dbeafe;
+    color: #1e3a8a;
+}
+
+.status.success {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.status.error {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.empty {
+    color: #64748b;
+    padding: 15px;
 }
 
 table {
@@ -1267,38 +1556,14 @@ table {
 
 th,
 td {
+    border-bottom: 1px solid #e5e7eb;
     padding: 9px;
-    border-bottom: 1px solid #ddd;
     text-align: left;
 }
 
-video {
-    width: 100%;
-    max-width: 700px;
-    background: black;
-    border-radius: 10px;
-}
-
-.camera-buttons {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 10px;
-}
-
 .small {
+    color: #64748b;
     font-size: 13px;
-    color: #6b7280;
-}
-
-.hidden {
-    display: none !important;
-}
-
-footer {
-    text-align: center;
-    padding: 30px;
-    color: #777;
 }
 
 </style>
@@ -1315,64 +1580,84 @@ footer {
 
 </header>
 
-
 <nav>
 
-<button class="nav-btn active" data-tab="dashboard">
+<button
+    class="nav-btn active"
+    onclick="showTab('dashboard', this)"
+>
 Dashboard
 </button>
 
-<button class="nav-btn" data-tab="camera">
+<button
+    class="nav-btn"
+    onclick="showTab('camera', this)"
+>
 Camera
 </button>
 
-<button class="nav-btn" data-tab="buckets">
+<button
+    class="nav-btn"
+    onclick="showTab('buckets', this)"
+>
 Buckets
 </button>
 
-<button class="nav-btn" data-tab="training">
+<button
+    class="nav-btn"
+    onclick="showTab('training', this)"
+>
 Training
 </button>
 
-<button class="nav-btn" data-tab="history">
+<button
+    class="nav-btn"
+    onclick="showTab('history', this)"
+>
 History
 </button>
 
-<button class="nav-btn" data-tab="settings">
+<button
+    class="nav-btn"
+    onclick="showTab('settings', this)"
+>
 Settings
 </button>
 
 </nav>
 
-
 <main>
 
-
-<!-- =====================================================
+<!-- ======================================================
      DASHBOARD
-====================================================== -->
+======================================================= -->
 
-<section id="dashboard" class="tab active">
+<section id="dashboard">
 
 <div class="card">
 
 <h2>Dashboard</h2>
 
-<div class="grid">
+<div class="stats">
 
 <div class="stat">
-Today
-<strong id="todayCount">0</strong>
+Training Images
+<strong id="dashTrainImages">0</strong>
 </div>
 
 <div class="stat">
-Total Buckets
-<strong id="totalCount">0</strong>
+Validation Images
+<strong id="dashValImages">0</strong>
 </div>
 
 <div class="stat">
-Model
-<strong id="modelStatus">Not trained</strong>
+Training Labels
+<strong id="dashTrainLabels">0</strong>
+</div>
+
+<div class="stat">
+Buckets Counted
+<strong id="dashBuckets">0</strong>
 </div>
 
 </div>
@@ -1382,58 +1667,36 @@ Model
 </section>
 
 
-<!-- =====================================================
+<!-- ======================================================
      CAMERA
-====================================================== -->
+======================================================= -->
 
-<section id="camera" class="tab">
+<section
+    id="camera"
+    class="hidden"
+>
 
 <div class="card">
 
-<h2>Camera Bucket Counter</h2>
+<h2>Camera</h2>
 
 <p>
-Camera detects only the trained
-<strong>BUCKET_LOADED</strong> class.
+Camera detection will use the trained
+BUCKET_LOADED model after training.
 </p>
 
-<video
-    id="cameraVideo"
-    autoplay
-    playsinline
->
-</video>
-
-<div class="camera-buttons">
-
 <button
-    class="primary"
-    onclick="startCamera()"
+    class="btn green"
+    onclick="checkModel()"
 >
-Start Camera
+Check AI Model
 </button>
-
-<button
-    class="danger"
-    onclick="stopCamera()"
->
-Stop Camera
-</button>
-
-<button
-    class="success"
-    onclick="captureAndDetect()"
->
-Detect Buckets
-</button>
-
-</div>
 
 <div
-    id="cameraResult"
-    class="message"
+    id="cameraStatus"
+    class="status"
 >
-Camera ready.
+Model not checked.
 </div>
 
 </div>
@@ -1441,95 +1704,89 @@ Camera ready.
 </section>
 
 
-<!-- =====================================================
+<!-- ======================================================
      BUCKETS
-====================================================== -->
+======================================================= -->
 
-<section id="buckets" class="tab">
+<section
+    id="buckets"
+    class="hidden"
+>
 
 <div class="card">
 
 <h2>Bucket Reference Photos</h2>
 
 <p class="small">
-Upload reference photos of the bucket type used at the mine.
+Upload reference photos of the bucket type.
 </p>
 
+<form
+    id="referenceForm"
+>
 <input
     type="file"
     id="referenceFile"
     accept="image/*"
+    required
 >
 
 <button
-    class="primary"
-    onclick="uploadReference()"
+    class="btn green"
+    type="submit"
 >
-Upload Reference Photo
+Upload Reference
 </button>
 
-<div
-    id="referenceMessage"
-    class="message"
->
-Ready.
-</div>
+</form>
 
-</div>
-
-<div
-    id="referenceList"
-    class="card"
->
-
-<h3>Reference Photos</h3>
-
-<div id="references"></div>
+<div id="referenceList"></div>
 
 </div>
 
 </section>
 
 
-<!-- =====================================================
+<!-- ======================================================
      TRAINING
-====================================================== -->
+======================================================= -->
 
-<section id="training" class="tab">
+<section
+    id="training"
+    class="hidden"
+>
 
 <div class="card">
 
 <h2>YOLO Training Dataset</h2>
 
-<div class="annotation-help">
-
-<strong>Hatua 1:</strong>
+<p>
+<b>Hatua 1:</b>
 Upload picha ya bucket.
+</p>
 
-<br>
+<p>
+<b>Hatua 2:</b>
+Chagua picha hapa chini na bonyeza Annotate.
+</p>
 
-<strong>Hatua 2:</strong>
-Chagua picha hapa chini na bonyeza
-<strong>Annotate</strong>.
+<p>
+<b>Hatua 3:</b>
+Tumia kidole au mouse kuchora rectangle
+kuizunguka loaded bucket.
+</p>
 
-<br>
-
-<strong>Hatua 3:</strong>
-Tumia kidole au mouse kuchora rectangle kuzunguka
-<strong>loaded bucket</strong>.
-
-<br>
-
-<strong>Muhimu:</strong>
+<p>
+<b>Muhimu:</b>
 Ukiachia kidole, rectangle
-<strong>HAITAONDOKA</strong>.
+<b>HAITAONDOKA.</b>
 Itabaki mpaka uifute au u-save labels.
+</p>
 
-</div>
-
+<hr>
 
 <label>
-Dataset Split
+<b>Dataset Split</b>
 </label>
 
 <select id="trainingSplit">
@@ -1544,28 +1801,27 @@ Validation
 
 </select>
 
-
-<label>
-Choose Image
-</label>
+<form id="datasetUploadForm">
 
 <input
     type="file"
-    id="trainingFile"
+    id="datasetFile"
     accept="image/*"
+    required
 >
 
 <button
-    class="primary"
-    onclick="uploadTrainingImage()"
+    class="btn green"
+    type="submit"
 >
 Upload Image
 </button>
 
+</form>
 
 <div
-    id="trainingUploadMessage"
-    class="message"
+    id="uploadMessage"
+    class="status"
 >
 Ready.
 </div>
@@ -1573,37 +1829,53 @@ Ready.
 </div>
 
 
-<!-- =====================================================
-     DATASET INFORMATION
-====================================================== -->
-
 <div class="card">
 
 <h2>Dataset Information</h2>
 
-<div
-    id="datasetStats"
->
-Loading...
+<div class="stats">
+
+<div class="stat">
+Training Images
+<strong id="trainingImages">0</strong>
+</div>
+
+<div class="stat">
+Validation Images
+<strong id="validationImages">0</strong>
+</div>
+
+<div class="stat">
+Training Labels
+<strong id="trainingLabels">0</strong>
+</div>
+
+<div class="stat">
+Validation Labels
+<strong id="validationLabels">0</strong>
+</div>
+
+<div class="stat">
+Unlabeled Training
+<strong id="unlabeledTraining">0</strong>
+</div>
+
+<div class="stat">
+Unlabeled Validation
+<strong id="unlabeledValidation">0</strong>
 </div>
 
 </div>
 
+</div>
 
-<!-- =====================================================
-     IMAGE LIST
-====================================================== -->
 
 <div class="card">
 
-<h2>Uploaded Images</h2>
-
-<p class="small">
-Choose an image and annotate the loaded bucket.
-</p>
+<h2>Training Images</h2>
 
 <div
-    id="datasetImages"
+    id="trainImagesList"
     class="dataset-grid"
 >
 Loading...
@@ -1612,9 +1884,19 @@ Loading...
 </div>
 
 
-<!-- =====================================================
-     ANNOTATOR
-====================================================== -->
+<div class="card">
+
+<h2>Validation Images</h2>
+
+<div
+    id="valImagesList"
+    class="dataset-grid"
+>
+Loading...
+</div>
+
+</div>
+
 
 <div
     id="annotationCard"
@@ -1623,130 +1905,117 @@ Loading...
 
 <h2>Draw Bucket Annotation</h2>
 
-<div class="annotation-help">
+<div class="annotation-info">
 
-Draw a rectangle around each
-<strong>loaded ore/material bucket</strong>.
+Draw a rectangle around each loaded
+ore/material bucket.
 
-<br>
+<br><br>
 
 You can draw multiple boxes.
 
 <br>
 
-Use your finger on a phone or mouse on a computer.
+Use your finger on a phone or mouse
+on a computer.
 
 <br>
 
-<strong>The line will remain after releasing your finger.</strong>
+The line will remain after releasing
+your finger.
 
 </div>
 
-
 <div
-    id="annotationFileName"
+    id="annotationImageInfo"
     class="small"
 >
 No image selected.
 </div>
 
-
-<div
-    id="annotationStage"
-    class="annotation-stage"
->
-
-<img
-    id="annotationImage"
-    draggable="false"
-    alt="Training image"
->
+<br>
 
 <canvas
     id="annotationCanvas"
->
-</canvas>
+></canvas>
+
+<br>
+
+<div>
+
+<b>
+Boxes:
+<span id="boxCount">0</span>
+</b>
 
 </div>
 
-
-<div
-    id="annotationInfo"
-    class="message"
->
-Boxes: 0
-</div>
-
-
-<div
-    class="annotation-buttons"
->
+<br>
 
 <button
-    class="primary"
+    class="btn gray"
     onclick="undoLastBox()"
 >
 Undo Last
 </button>
 
 <button
-    class="danger"
-    onclick="clearAnnotations()"
+    class="btn red"
+    onclick="clearBoxes()"
 >
 Clear All
 </button>
 
 <button
-    class="success"
+    class="btn green"
     onclick="saveAnnotations()"
 >
 Save YOLO Labels
 </button>
 
-</div>
-
-
-<div
-    id="boxList"
-    class="box-list"
->
-</div>
-
-
 <div
     id="annotationMessage"
-    class="message"
+    class="status"
 >
-Draw a rectangle around the bucket.
+Draw boxes around loaded buckets.
 </div>
 
 </div>
 
-
-<!-- =====================================================
-     TRAINING STATUS
-====================================================== -->
 
 <div class="card">
 
 <h2>Training Status</h2>
 
-<div id="trainingStatus">
-Status: idle
+<div
+    id="trainingStatus"
+    class="status"
+>
+Status: idle | Ready
 </div>
+
+<div class="progress-box">
+
+<div class="progress-track">
 
 <div
     id="trainingProgress"
-    class="message"
+    class="progress-bar"
 >
-Progress: 0%
+0%
 </div>
 
-<br>
+</div>
+
+</div>
+
+<p id="epochText">
+Epoch: 0 / 20
+</p>
 
 <button
     id="startTrainingButton"
-    class="success"
+    class="btn green"
     onclick="startTraining()"
 >
 Start YOLO Training
@@ -1757,47 +2026,28 @@ Start YOLO Training
 </section>
 
 
-<!-- =====================================================
+<!-- ======================================================
      HISTORY
-====================================================== -->
+======================================================= -->
 
-<section id="history" class="tab">
+<section
+    id="history"
+    class="hidden"
+>
 
 <div class="card">
 
-<h2>Bucket Count History</h2>
+<h2>Bucket History</h2>
 
 <button
-    class="primary"
+    class="btn"
     onclick="loadHistory()"
 >
 Refresh
 </button>
 
-<div
-    style="overflow-x:auto;margin-top:15px;"
->
-
-<table>
-
-<thead>
-
-<tr>
-<th>ID</th>
-<th>Count</th>
-<th>Date</th>
-<th>Shift</th>
-<th>Created</th>
-</tr>
-
-</thead>
-
-<tbody id="historyBody">
-
-</tbody>
-
-</table>
-
+<div id="historyTable">
+Loading...
 </div>
 
 </div>
@@ -1805,146 +2055,179 @@ Refresh
 </section>
 
 
-<!-- =====================================================
+<!-- ======================================================
      SETTINGS
-====================================================== -->
+======================================================= -->
 
-<section id="settings" class="tab">
+<section
+    id="settings"
+    class="hidden"
+>
 
 <div class="card">
 
 <h2>Settings</h2>
 
 <p>
-Application:
-<strong>NEERIKA BUCKET AI</strong>
+Model:
+<b>BUCKET_LOADED</b>
 </p>
 
 <p>
-Class:
-<strong>BUCKET_LOADED</strong>
+Epochs:
+<b id="settingsEpochs">
+20
+</b>
 </p>
 
 <p>
-Class ID:
-<strong>0</strong>
+Image size:
+<b>
+640
+</b>
 </p>
 
 <p>
-Database:
-<strong>Supabase PostgreSQL</strong>
-</p>
-
-<p>
-Training:
-<strong>YOLO</strong>
+Purpose:
+Count loaded ore/material buckets
+coming from the shaft.
 </p>
 
 </div>
 
 </section>
 
-
 </main>
-
-
-<footer>
-Geology &amp; Mining Services
-</footer>
 
 
 <script>
 
-/* ========================================================
-   GLOBAL STATE
-======================================================== */
-
-let cameraStream = null;
-
 let annotation = {
-    filename: null,
+
+    image: null,
+
+    filename: "",
+
     split: "train",
+
     boxes: [],
+
     drawing: false,
+
     startX: 0,
+
     startY: 0,
-    current: null
+
+    currentX: 0,
+
+    currentY: 0
+
 };
 
 
-/* ========================================================
-   NAVIGATION
-======================================================== */
-
-document.querySelectorAll(".nav-btn").forEach(function(button) {
-
-    button.addEventListener("click", function() {
-
-        document.querySelectorAll(".nav-btn")
-            .forEach(function(btn) {
-                btn.classList.remove("active");
-            });
-
-        document.querySelectorAll(".tab")
-            .forEach(function(tab) {
-                tab.classList.remove("active");
-            });
-
-        button.classList.add("active");
-
-        const tab = document.getElementById(
-            button.dataset.tab
-        );
-
-        if (tab) {
-            tab.classList.add("active");
-        }
-
-        if (button.dataset.tab === "training") {
-            loadTrainingImages();
-            loadDatasetStats();
-            loadTrainingStatus();
-        }
-
-        if (button.dataset.tab === "history") {
-            loadHistory();
-        }
-
-        if (button.dataset.tab === "buckets") {
-            loadReferences();
-        }
-
-    });
-
-});
-
-
-/* ========================================================
-   BASIC API
-======================================================== */
-
-async function apiJSON(url, options) {
-
-    const response = await fetch(
-        url,
-        options || {}
+let annotationCanvas =
+    document.getElementById(
+        "annotationCanvas"
     );
 
-    const text = await response.text();
+let ctx =
+    annotationCanvas.getContext(
+        "2d"
+    );
+
+
+let trainingPoller = null;
+
+
+function showTab(
+    tab,
+    button
+) {
+
+    document
+        .querySelectorAll(
+            "main > section"
+        )
+        .forEach(
+            section => {
+                section.classList.add(
+                    "hidden"
+                );
+            }
+        );
+
+    document
+        .getElementById(tab)
+        .classList.remove(
+            "hidden"
+        );
+
+    document
+        .querySelectorAll(
+            ".nav-btn"
+        )
+        .forEach(
+            btn => {
+                btn.classList.remove(
+                    "active"
+                );
+            }
+        );
+
+    if (button) {
+        button.classList.add(
+            "active"
+        );
+    }
+
+    if (tab === "training") {
+        loadDataset();
+        loadDatasetImages();
+        loadTrainingStatus();
+    }
+
+    if (tab === "history") {
+        loadHistory();
+    }
+
+    if (tab === "buckets") {
+        loadReferences();
+    }
+}
+
+
+async function api(
+    url,
+    options = {}
+) {
+
+    const response =
+        await fetch(
+            url,
+            options
+        );
+
+    const text =
+        await response.text();
 
     let data;
 
     try {
         data = JSON.parse(text);
-    } catch (e) {
+    }
+
+    catch {
         throw new Error(
-            text || "Invalid server response."
+            text ||
+            "Server returned invalid response."
         );
     }
 
-    if (!response.ok || data.ok === false) {
+    if (!response.ok) {
         throw new Error(
-            data.message || "Request failed."
+            data.error ||
+            data.message ||
+            "Request failed."
         );
     }
 
@@ -1952,444 +2235,196 @@ async function apiJSON(url, options) {
 }
 
 
-/* ========================================================
-   DASHBOARD
-======================================================== */
+/* =========================================================
+   DATASET UPLOAD
+========================================================= */
 
-async function loadDashboard() {
+document
+    .getElementById(
+        "datasetUploadForm"
+    )
+    .addEventListener(
+        "submit",
+        async function(e) {
 
-    try {
+            e.preventDefault();
 
-        const data = await apiJSON(
-            "/api/dashboard"
-        );
+            const file =
+                document.getElementById(
+                    "datasetFile"
+                ).files[0];
 
-        document.getElementById(
-            "todayCount"
-        ).textContent = data.today;
+            const split =
+                document.getElementById(
+                    "trainingSplit"
+                ).value;
 
-        document.getElementById(
-            "totalCount"
-        ).textContent = data.total;
-
-        document.getElementById(
-            "modelStatus"
-        ).textContent = data.model
-            ? "Ready"
-            : "Not trained";
-
-    } catch (error) {
-
-        console.error(error);
-
-    }
-}
-
-
-/* ========================================================
-   CAMERA
-======================================================== */
-
-async function startCamera() {
-
-    const video = document.getElementById(
-        "cameraVideo"
-    );
-
-    const result = document.getElementById(
-        "cameraResult"
-    );
-
-    try {
-
-        cameraStream =
-            await navigator.mediaDevices.getUserMedia({
-                video: {
-                    facingMode: {
-                        ideal: "environment"
-                    }
-                },
-                audio: false
-            });
-
-        video.srcObject = cameraStream;
-
-        result.className = "message ok";
-        result.textContent =
-            "Camera started.";
-
-    } catch (error) {
-
-        result.className = "message error";
-        result.textContent =
-            "Camera error: " + error.message;
-    }
-}
-
-
-function stopCamera() {
-
-    if (cameraStream) {
-
-        cameraStream
-            .getTracks()
-            .forEach(function(track) {
-                track.stop();
-            });
-
-        cameraStream = null;
-    }
-
-    document.getElementById(
-        "cameraVideo"
-    ).srcObject = null;
-
-    document.getElementById(
-        "cameraResult"
-    ).textContent = "Camera stopped.";
-}
-
-
-async function captureAndDetect() {
-
-    const video = document.getElementById(
-        "cameraVideo"
-    );
-
-    const result = document.getElementById(
-        "cameraResult"
-    );
-
-    if (!video.videoWidth) {
-
-        result.className = "message error";
-        result.textContent =
-            "Start camera first.";
-
-        return;
-    }
-
-    const canvas =
-        document.createElement("canvas");
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    const ctx = canvas.getContext("2d");
-
-    ctx.drawImage(
-        video,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-    );
-
-    canvas.toBlob(async function(blob) {
-
-        try {
-
-            result.className = "message";
-            result.textContent =
-                "Detecting...";
+            if (!file) {
+                return;
+            }
 
             const form =
                 new FormData();
 
             form.append(
-                "image",
-                blob,
-                "camera.jpg"
+                "file",
+                file
             );
 
-            const data =
-                await apiJSON(
-                    "/api/detect",
-                    {
-                        method: "POST",
-                        body: form
-                    }
+            form.append(
+                "split",
+                split
+            );
+
+            const msg =
+                document.getElementById(
+                    "uploadMessage"
                 );
 
-            result.className = "message ok";
+            msg.className =
+                "status";
 
-            result.textContent =
-                "Detected loaded buckets: "
-                + data.count;
+            msg.textContent =
+                "Uploading image...";
 
-            if (data.count > 0) {
+            try {
 
-                await apiJSON(
-                    "/api/count",
-                    {
-                        method: "POST",
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-                        body: JSON.stringify({
-                            count: data.count,
-                            shift: "A"
-                        })
-                    }
+                const data =
+                    await api(
+                        "/api/dataset/upload",
+                        {
+                            method: "POST",
+                            body: form
+                        }
+                    );
+
+                msg.className =
+                    "status success";
+
+                msg.textContent =
+                    "Image uploaded. Now draw the bucket box.";
+
+                // Important:
+                // use the ACTUAL split returned
+                // by server
+                document.getElementById(
+                    "trainingSplit"
+                ).value =
+                    data.split;
+
+                await loadDataset();
+
+                await loadDatasetImages();
+
+                openAnnotation(
+                    data.filename,
+                    data.split
                 );
 
-                loadDashboard();
             }
 
-        } catch (error) {
+            catch(error) {
 
-            result.className = "message error";
+                msg.className =
+                    "status error";
 
-            result.textContent =
-                error.message;
+                msg.textContent =
+                    error.message;
+            }
         }
-
-    }, "image/jpeg", 0.9);
-}
-
-
-/* ========================================================
-   REFERENCE IMAGES
-======================================================== */
-
-async function uploadReference() {
-
-    const input =
-        document.getElementById(
-            "referenceFile"
-        );
-
-    const message =
-        document.getElementById(
-            "referenceMessage"
-        );
-
-    if (!input.files.length) {
-
-        message.className =
-            "message error";
-
-        message.textContent =
-            "Choose an image first.";
-
-        return;
-    }
-
-    const form =
-        new FormData();
-
-    form.append(
-        "image",
-        input.files[0]
     );
 
-    try {
 
-        const data =
-            await apiJSON(
-                "/api/reference/upload",
-                {
-                    method: "POST",
-                    body: form
-                }
-            );
-
-        message.className =
-            "message ok";
-
-        message.textContent =
-            data.message;
-
-        input.value = "";
-
-        loadReferences();
-
-    } catch (error) {
-
-        message.className =
-            "message error";
-
-        message.textContent =
-            error.message;
-    }
-}
-
-
-async function loadReferences() {
-
-    const container =
-        document.getElementById(
-            "references"
-        );
-
-    try {
-
-        const data =
-            await apiJSON(
-                "/api/references"
-            );
-
-        if (!data.references.length) {
-
-            container.innerHTML =
-                "<p>No reference photos yet.</p>";
-
-            return;
-        }
-
-        container.innerHTML =
-            data.references
-                .map(function(file) {
-
-                    return `
-                    <div style="margin-bottom:15px;">
-                        <img
-                            src="${file.url}"
-                            style="
-                                width:180px;
-                                max-width:100%;
-                                border-radius:8px;
-                            "
-                        >
-                        <div class="small">
-                            ${file.filename}
-                        </div>
-                    </div>
-                    `;
-
-                })
-                .join("");
-
-    } catch (error) {
-
-        container.textContent =
-            error.message;
-    }
-}
-
-
-/* ========================================================
-   DATASET UPLOAD
-======================================================== */
-
-document.getElementById(
-    "trainingSplit"
-).addEventListener(
-    "change",
-    function() {
-
-        annotation.split = this.value;
-
-        loadTrainingImages();
-    }
-);
-
-
-async function uploadTrainingImage() {
-
-    const input =
-        document.getElementById(
-            "trainingFile"
-        );
-
-    const split =
-        document.getElementById(
-            "trainingSplit"
-        ).value;
-
-    const message =
-        document.getElementById(
-            "trainingUploadMessage"
-        );
-
-    if (!input.files.length) {
-
-        message.className =
-            "message error";
-
-        message.textContent =
-            "Choose an image first.";
-
-        return;
-    }
-
-    const form =
-        new FormData();
-
-    form.append(
-        "image",
-        input.files[0]
-    );
-
-    form.append(
-        "split",
-        split
-    );
-
-    try {
-
-        message.className =
-            "message";
-
-        message.textContent =
-            "Uploading image...";
-
-        const data =
-            await apiJSON(
-                "/api/dataset/upload",
-                {
-                    method: "POST",
-                    body: form
-                }
-            );
-
-        message.className =
-            "message ok";
-
-        message.textContent =
-            "Image uploaded. Now draw the bucket box.";
-
-        input.value = "";
-
-        await loadDatasetStats();
-
-        await loadTrainingImages();
-
-        openAnnotation({
-            filename: data.filename,
-            split: data.split,
-            label_exists: false,
-            url: data.url
-        });
-
-    } catch (error) {
-
-        message.className =
-            "message error";
-
-        message.textContent =
-            error.message;
-    }
-}
-
-
-/* ========================================================
+/* =========================================================
    DATASET LIST
-======================================================== */
+========================================================= */
 
-async function loadTrainingImages() {
+async function loadDataset() {
 
-    const split =
+    try {
+
+        const data =
+            await api(
+                "/api/dataset/stats"
+            );
+
         document.getElementById(
-            "trainingSplit"
-        ).value;
+            "trainingImages"
+        ).textContent =
+            data.training_images;
 
-    annotation.split = split;
+        document.getElementById(
+            "validationImages"
+        ).textContent =
+            data.validation_images;
+
+        document.getElementById(
+            "trainingLabels"
+        ).textContent =
+            data.training_labels;
+
+        document.getElementById(
+            "validationLabels"
+        ).textContent =
+            data.validation_labels;
+
+        document.getElementById(
+            "unlabeledTraining"
+        ).textContent =
+            data.unlabeled_training;
+
+        document.getElementById(
+            "unlabeledValidation"
+        ).textContent =
+            data.unlabeled_validation;
+
+        document.getElementById(
+            "dashTrainImages"
+        ).textContent =
+            data.training_images;
+
+        document.getElementById(
+            "dashValImages"
+        ).textContent =
+            data.validation_images;
+
+        document.getElementById(
+            "dashTrainLabels"
+        ).textContent =
+            data.training_labels;
+
+    }
+
+    catch(error) {
+
+        console.error(
+            error
+        );
+    }
+}
+
+
+async function loadDatasetImages() {
+
+    await loadDatasetImagesForSplit(
+        "train"
+    );
+
+    await loadDatasetImagesForSplit(
+        "val"
+    );
+}
+
+
+async function loadDatasetImagesForSplit(
+    split
+) {
 
     const container =
         document.getElementById(
-            "datasetImages"
+            split === "train"
+                ? "trainImagesList"
+                : "valImagesList"
         );
 
     container.innerHTML =
@@ -2398,896 +2433,858 @@ async function loadTrainingImages() {
     try {
 
         const data =
-            await apiJSON(
-                "/api/dataset/list?split="
-                + encodeURIComponent(split)
+            await api(
+                "/api/dataset/images?split=" +
+                encodeURIComponent(
+                    split
+                )
             );
 
-        if (!data.images.length) {
+        if (
+            !data.images ||
+            data.images.length === 0
+        ) {
 
             container.innerHTML =
-                "<p>No images uploaded yet.</p>";
+                '<div class="empty">' +
+                'No images uploaded yet.' +
+                '</div>';
 
             return;
         }
 
-        container.innerHTML = "";
+        container.innerHTML =
+            "";
 
-        data.images.forEach(function(item) {
+        data.images.forEach(
+            image => {
 
-            const card =
-                document.createElement("div");
+                const card =
+                    document.createElement(
+                        "div"
+                    );
 
-            card.className =
-                "dataset-item";
+                card.className =
+                    "image-card";
 
-            const img =
-                document.createElement("img");
+                const badgeClass =
+                    image.labeled
+                        ? "green"
+                        : "orange";
 
-            img.src =
-                item.url
-                + "?v="
-                + Date.now();
+                const badgeText =
+                    image.labeled
+                        ? "LABELED"
+                        : "NEEDS ANNOTATION";
 
-            img.alt =
-                item.filename;
+                card.innerHTML = `
 
-            const body =
-                document.createElement("div");
+                    <img
+                        src="/api/dataset/image?split=${encodeURIComponent(split)}&filename=${encodeURIComponent(image.filename)}"
+                        alt=""
+                    >
 
-            body.className =
-                "dataset-item-body";
+                    <div class="filename">
+                        ${escapeHtml(image.filename)}
+                    </div>
 
-            const name =
-                document.createElement("div");
+                    <span class="badge ${badgeClass}">
+                        ${badgeText}
+                    </span>
 
-            name.className =
-                "dataset-name";
+                    <br>
 
-            name.textContent =
-                item.filename;
+                    <button
+                        class="btn"
+                        onclick="openAnnotation('${escapeJs(image.filename)}','${split}')"
+                    >
+                        Annotate
+                    </button>
 
-            const badge =
-                document.createElement("span");
+                `;
 
-            badge.className =
-                item.label_exists
-                    ? "badge ok"
-                    : "badge warning";
+                container.appendChild(
+                    card
+                );
+            }
+        );
 
-            badge.textContent =
-                item.label_exists
-                    ? "LABELED"
-                    : "NEEDS ANNOTATION";
+    }
 
-            const button =
-                document.createElement("button");
-
-            button.className =
-                "primary";
-
-            button.textContent =
-                "Annotate";
-
-            button.style.width =
-                "100%";
-
-            button.onclick =
-                function() {
-                    openAnnotation(item);
-                };
-
-            body.appendChild(name);
-            body.appendChild(badge);
-            body.appendChild(button);
-
-            card.appendChild(img);
-            card.appendChild(body);
-
-            container.appendChild(card);
-
-        });
-
-    } catch (error) {
+    catch(error) {
 
         container.innerHTML =
-            '<div class="message error">'
-            + error.message
-            + "</div>";
+            '<div class="empty">' +
+            escapeHtml(
+                error.message
+            ) +
+            '</div>';
     }
 }
 
 
-/* ========================================================
-   OPEN ANNOTATOR
-======================================================== */
+function escapeHtml(
+    value
+) {
 
-function openAnnotation(item) {
-
-    const card =
-        document.getElementById(
-            "annotationCard"
+    return String(value)
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        )
+        .replaceAll(
+            "'",
+            "&#039;"
         );
-
-    const image =
-        document.getElementById(
-            "annotationImage"
-        );
-
-    const canvas =
-        document.getElementById(
-            "annotationCanvas"
-        );
-
-    const fileName =
-        document.getElementById(
-            "annotationFileName"
-        );
-
-    annotation = {
-        filename: item.filename,
-        split: item.split,
-        boxes: [],
-        drawing: false,
-        startX: 0,
-        startY: 0,
-        current: null
-    };
-
-    fileName.textContent =
-        "Image: "
-        + item.filename
-        + " | Split: "
-        + item.split;
-
-    card.classList.remove("hidden");
-
-    /*
-       Cache-buster ensures the browser loads
-       the latest uploaded image.
-    */
-
-    image.onload = function() {
-
-        canvas.width =
-            image.naturalWidth;
-
-        canvas.height =
-            image.naturalHeight;
-
-        redrawAnnotations();
-
-        updateAnnotationInfo();
-    };
-
-    image.src =
-        item.url
-        + "?v="
-        + Date.now();
-
-    card.scrollIntoView({
-        behavior: "smooth",
-        block: "start"
-    });
-
-    document.getElementById(
-        "annotationMessage"
-    ).className = "message";
-
-    document.getElementById(
-        "annotationMessage"
-    ).textContent =
-        "Now draw a rectangle around the loaded bucket.";
 }
 
 
-/* ========================================================
-   CANVAS COORDINATES
-======================================================== */
+function escapeJs(
+    value
+) {
 
-function getCanvasPoint(event) {
+    return String(value)
+        .replaceAll(
+            "\\",
+            "\\\\"
+        )
+        .replaceAll(
+            "'",
+            "\\'"
+        );
+}
 
-    const canvas =
-        document.getElementById(
-            "annotationCanvas"
+
+/* =========================================================
+   ANNOTATION
+========================================================= */
+
+function openAnnotation(
+    filename,
+    split
+) {
+
+    annotation.filename =
+        filename;
+
+    annotation.split =
+        split;
+
+    annotation.boxes =
+        [];
+
+    annotation.drawing =
+        false;
+
+    document.getElementById(
+        "annotationCard"
+    ).classList.remove(
+        "hidden"
+    );
+
+    document.getElementById(
+        "annotationImageInfo"
+    ).textContent =
+        "Image: " +
+        filename +
+        " | Split: " +
+        split;
+
+    document.getElementById(
+        "boxCount"
+    ).textContent =
+        "0";
+
+    const image =
+        new Image();
+
+    image.onload =
+        async function() {
+
+            annotation.image =
+                image;
+
+            resizeCanvas();
+
+            // Load existing labels
+            try {
+
+                const data =
+                    await api(
+                        "/api/dataset/labels?split=" +
+                        encodeURIComponent(
+                            split
+                        ) +
+                        "&filename=" +
+                        encodeURIComponent(
+                            filename
+                        )
+                    );
+
+                if (
+                    data.boxes &&
+                    data.boxes.length
+                ) {
+
+                    annotation.boxes =
+                        data.boxes.map(
+                            box => {
+
+                                return {
+                                    x:
+                                        box.x,
+                                    y:
+                                        box.y,
+                                    w:
+                                        box.w,
+                                    h:
+                                        box.h
+                                };
+
+                            }
+                        );
+
+                    document.getElementById(
+                        "boxCount"
+                    ).textContent =
+                        annotation.boxes.length;
+                }
+
+            }
+
+            catch(error) {
+
+                console.error(
+                    error
+                );
+            }
+
+            drawCanvas();
+        };
+
+    image.onerror =
+        function() {
+
+            document.getElementById(
+                "annotationMessage"
+            ).textContent =
+                "Failed to load image.";
+
+        };
+
+    image.src =
+        "/api/dataset/image?split=" +
+        encodeURIComponent(
+            split
+        ) +
+        "&filename=" +
+        encodeURIComponent(
+            filename
         );
 
+    document
+        .getElementById(
+            "annotationCard"
+        )
+        .scrollIntoView({
+            behavior: "smooth",
+            block: "start"
+        });
+}
+
+
+function resizeCanvas() {
+
+    if (!annotation.image) {
+        return;
+    }
+
+    const maxWidth =
+        Math.min(
+            900,
+            window.innerWidth - 35
+        );
+
+    const ratio =
+        annotation.image.width /
+        annotation.image.height;
+
+    annotationCanvas.width =
+        Math.max(
+            300,
+            Math.floor(maxWidth)
+        );
+
+    annotationCanvas.height =
+        Math.floor(
+            annotationCanvas.width /
+            ratio
+        );
+
+    drawCanvas();
+}
+
+
+function canvasPoint(
+    event
+) {
+
     const rect =
-        canvas.getBoundingClientRect();
+        annotationCanvas.getBoundingClientRect();
 
     const scaleX =
-        canvas.width / rect.width;
+        annotationCanvas.width /
+        rect.width;
 
     const scaleY =
-        canvas.height / rect.height;
+        annotationCanvas.height /
+        rect.height;
 
     return {
         x:
-            (event.clientX - rect.left)
-            * scaleX,
+            (event.clientX - rect.left) *
+            scaleX,
 
         y:
-            (event.clientY - rect.top)
-            * scaleY
+            (event.clientY - rect.top) *
+            scaleY
     };
 }
 
 
-/* ========================================================
-   POINTER DOWN
-======================================================== */
+function drawCanvas() {
 
-document.getElementById(
-    "annotationCanvas"
-).addEventListener(
-    "pointerdown",
-    function(event) {
-
-        event.preventDefault();
-
-        if (!annotation.filename) {
-            return;
-        }
-
-        const point =
-            getCanvasPoint(event);
-
-        annotation.drawing = true;
-
-        annotation.startX =
-            point.x;
-
-        annotation.startY =
-            point.y;
-
-        annotation.current = {
-            x1: point.x,
-            y1: point.y,
-            x2: point.x,
-            y2: point.y
-        };
-
-        /*
-           Pointer capture is VERY IMPORTANT
-           on mobile. It keeps the drawing alive
-           while the finger moves.
-        */
-
-        try {
-            this.setPointerCapture(
-                event.pointerId
-            );
-        } catch (e) {
-        }
-
-        redrawAnnotations();
-
-    },
-    { passive: false }
-);
-
-
-/* ========================================================
-   POINTER MOVE
-======================================================== */
-
-document.getElementById(
-    "annotationCanvas"
-).addEventListener(
-    "pointermove",
-    function(event) {
-
-        event.preventDefault();
-
-        if (!annotation.drawing) {
-            return;
-        }
-
-        const point =
-            getCanvasPoint(event);
-
-        annotation.current = {
-            x1: annotation.startX,
-            y1: annotation.startY,
-            x2: point.x,
-            y2: point.y
-        };
-
-        redrawAnnotations();
-
-    },
-    { passive: false }
-);
-
-
-/* ========================================================
-   POINTER UP
-======================================================== */
-
-document.getElementById(
-    "annotationCanvas"
-).addEventListener(
-    "pointerup",
-    function(event) {
-
-        event.preventDefault();
-
-        if (!annotation.drawing) {
-            return;
-        }
-
-        const point =
-            getCanvasPoint(event);
-
-        let x1 =
-            Math.min(
-                annotation.startX,
-                point.x
-            );
-
-        let y1 =
-            Math.min(
-                annotation.startY,
-                point.y
-            );
-
-        let x2 =
-            Math.max(
-                annotation.startX,
-                point.x
-            );
-
-        let y2 =
-            Math.max(
-                annotation.startY,
-                point.y
-            );
-
-        const width =
-            x2 - x1;
-
-        const height =
-            y2 - y1;
-
-        annotation.drawing = false;
-
-        annotation.current = null;
-
-        /*
-           Ignore accidental tiny touches.
-        */
-
-        if (
-            width >= 8 &&
-            height >= 8
-        ) {
-
-            /*
-               THIS IS THE IMPORTANT PART:
-               The completed box is pushed into
-               annotation.boxes.
-
-               Therefore it stays after finger release.
-            */
-
-            annotation.boxes.push({
-                x1: x1,
-                y1: y1,
-                x2: x2,
-                y2: y2
-            });
-
-        }
-
-        try {
-            this.releasePointerCapture(
-                event.pointerId
-            );
-        } catch (e) {
-        }
-
-        redrawAnnotations();
-
-        updateAnnotationInfo();
-
-    },
-    { passive: false }
-);
-
-
-/* ========================================================
-   POINTER CANCEL
-======================================================== */
-
-document.getElementById(
-    "annotationCanvas"
-).addEventListener(
-    "pointercancel",
-    function(event) {
-
-        annotation.drawing = false;
-        annotation.current = null;
-
-        redrawAnnotations();
-
-    },
-    { passive: false }
-);
-
-
-/* ========================================================
-   DRAW ALL BOXES
-======================================================== */
-
-function redrawAnnotations() {
-
-    const canvas =
-        document.getElementById(
-            "annotationCanvas"
-        );
-
-    const ctx =
-        canvas.getContext("2d");
-
-    if (!canvas.width || !canvas.height) {
+    if (!annotation.image) {
         return;
     }
 
     ctx.clearRect(
         0,
         0,
-        canvas.width,
-        canvas.height
+        annotationCanvas.width,
+        annotationCanvas.height
     );
 
-    const lineWidth =
+    ctx.drawImage(
+        annotation.image,
+        0,
+        0,
+        annotationCanvas.width,
+        annotationCanvas.height
+    );
+
+    ctx.lineWidth =
         Math.max(
-            3,
-            canvas.width / 500
+            2,
+            annotationCanvas.width / 300
         );
 
-    const fontSize =
-        Math.max(
-            16,
-            canvas.width / 45
-        );
-
-    /*
-       Draw saved boxes first.
-    */
+    ctx.font =
+        "bold 16px Arial";
 
     annotation.boxes.forEach(
-        function(box, index) {
+        (box, index) => {
 
-            drawBox(
-                ctx,
-                box,
-                index + 1,
-                lineWidth,
-                fontSize
+            const x =
+                box.x *
+                annotationCanvas.width;
+
+            const y =
+                box.y *
+                annotationCanvas.height;
+
+            const w =
+                box.w *
+                annotationCanvas.width;
+
+            const h =
+                box.h *
+                annotationCanvas.height;
+
+            ctx.strokeStyle =
+                "#00ff00";
+
+            ctx.strokeRect(
+                x,
+                y,
+                w,
+                h
+            );
+
+            ctx.fillStyle =
+                "rgba(0,0,0,.65)";
+
+            ctx.fillRect(
+                x,
+                Math.max(
+                    0,
+                    y - 24
+                ),
+                95,
+                24
+            );
+
+            ctx.fillStyle =
+                "#ffffff";
+
+            ctx.fillText(
+                "Bucket " +
+                (index + 1),
+                x + 5,
+                Math.max(
+                    17,
+                    y - 7
+                )
             );
 
         }
     );
 
-    /*
-       Draw current box while finger
-       is still moving.
-    */
+    // Current drawing box
+    if (
+        annotation.drawing
+    ) {
 
-    if (annotation.current) {
+        const x =
+            Math.min(
+                annotation.startX,
+                annotation.currentX
+            );
 
-        drawBox(
-            ctx,
-            annotation.current,
-            annotation.boxes.length + 1,
-            lineWidth,
-            fontSize,
-            true
+        const y =
+            Math.min(
+                annotation.startY,
+                annotation.currentY
+            );
+
+        const w =
+            Math.abs(
+                annotation.currentX -
+                annotation.startX
+            );
+
+        const h =
+            Math.abs(
+                annotation.currentY -
+                annotation.startY
+            );
+
+        ctx.strokeStyle =
+            "#ff0000";
+
+        ctx.lineWidth = 3;
+
+        ctx.strokeRect(
+            x,
+            y,
+            w,
+            h
         );
-
     }
 }
 
 
-/* ========================================================
-   DRAW SINGLE BOX
-======================================================== */
+/* =========================================================
+   POINTER EVENTS
+========================================================= */
 
-function drawBox(
-    ctx,
-    box,
-    number,
-    lineWidth,
-    fontSize,
-    temporary
+annotationCanvas.addEventListener(
+    "pointerdown",
+    function(event) {
+
+        if (!annotation.image) {
+            return;
+        }
+
+        event.preventDefault();
+
+        try {
+            annotationCanvas.setPointerCapture(
+                event.pointerId
+            );
+        }
+
+        catch(error) {}
+
+        const p =
+            canvasPoint(event);
+
+        annotation.drawing =
+            true;
+
+        annotation.startX =
+            p.x;
+
+        annotation.startY =
+            p.y;
+
+        annotation.currentX =
+            p.x;
+
+        annotation.currentY =
+            p.y;
+
+        drawCanvas();
+    }
+);
+
+
+annotationCanvas.addEventListener(
+    "pointermove",
+    function(event) {
+
+        if (
+            !annotation.drawing
+        ) {
+            return;
+        }
+
+        event.preventDefault();
+
+        const p =
+            canvasPoint(event);
+
+        annotation.currentX =
+            p.x;
+
+        annotation.currentY =
+            p.y;
+
+        drawCanvas();
+    }
+);
+
+
+function finishPointer(
+    event
 ) {
 
-    const x =
-        Math.min(
-            box.x1,
-            box.x2
-        );
-
-    const y =
-        Math.min(
-            box.y1,
-            box.y2
-        );
-
-    const width =
-        Math.abs(
-            box.x2 - box.x1
-        );
-
-    const height =
-        Math.abs(
-            box.y2 - box.y1
-        );
-
-    ctx.save();
-
-    ctx.lineWidth =
-        lineWidth;
-
-    ctx.strokeStyle =
-        temporary
-            ? "#f59e0b"
-            : "#22c55e";
-
-    ctx.fillStyle =
-        temporary
-            ? "rgba(245,158,11,0.15)"
-            : "rgba(34,197,94,0.15)";
-
-    ctx.fillRect(
-        x,
-        y,
-        width,
-        height
-    );
-
-    ctx.strokeRect(
-        x,
-        y,
-        width,
-        height
-    );
-
-    ctx.font =
-        "bold "
-        + fontSize
-        + "px Arial";
-
-    ctx.fillStyle =
-        temporary
-            ? "#f59e0b"
-            : "#22c55e";
-
-    ctx.fillText(
-        "BUCKET "
-        + number,
-        x + 5,
-        Math.max(
-            fontSize + 4,
-            y + fontSize
-        )
-    );
-
-    ctx.restore();
-}
-
-
-/* ========================================================
-   ANNOTATION INFO
-======================================================== */
-
-function updateAnnotationInfo() {
-
-    document.getElementById(
-        "annotationInfo"
-    ).textContent =
-        "Boxes: "
-        + annotation.boxes.length;
-}
-
-
-/* ========================================================
-   UNDO
-======================================================== */
-
-function undoLastBox() {
-
-    if (!annotation.boxes.length) {
+    if (
+        !annotation.drawing
+    ) {
         return;
     }
 
-    annotation.boxes.pop();
+    event.preventDefault();
 
-    redrawAnnotations();
+    const p =
+        canvasPoint(event);
 
-    updateAnnotationInfo();
+    annotation.currentX =
+        p.x;
+
+    annotation.currentY =
+        p.y;
+
+    let x =
+        Math.min(
+            annotation.startX,
+            annotation.currentX
+        );
+
+    let y =
+        Math.min(
+            annotation.startY,
+            annotation.currentY
+        );
+
+    let w =
+        Math.abs(
+            annotation.currentX -
+            annotation.startX
+        );
+
+    let h =
+        Math.abs(
+            annotation.currentY -
+            annotation.startY
+        );
+
+    annotation.drawing =
+        false;
+
+    if (
+        w >= 10 &&
+        h >= 10
+    ) {
+
+        const canvasWidth =
+            annotationCanvas.width;
+
+        const canvasHeight =
+            annotationCanvas.height;
+
+        // Clamp
+        x =
+            Math.max(
+                0,
+                Math.min(
+                    x,
+                    canvasWidth
+                )
+            );
+
+        y =
+            Math.max(
+                0,
+                Math.min(
+                    y,
+                    canvasHeight
+                )
+            );
+
+        w =
+            Math.min(
+                w,
+                canvasWidth - x
+            );
+
+        h =
+            Math.min(
+                h,
+                canvasHeight - y
+            );
+
+        annotation.boxes.push({
+            x:
+                x / canvasWidth,
+
+            y:
+                y / canvasHeight,
+
+            w:
+                w / canvasWidth,
+
+            h:
+                h / canvasHeight
+        });
+
+        document.getElementById(
+            "boxCount"
+        ).textContent =
+            annotation.boxes.length;
+
+        document.getElementById(
+            "annotationMessage"
+        ).textContent =
+            "Box added. You can draw another bucket.";
+    }
+
+    drawCanvas();
+
+    try {
+        annotationCanvas.releasePointerCapture(
+            event.pointerId
+        );
+    }
+
+    catch(error) {}
 }
 
 
-/* ========================================================
-   CLEAR
-======================================================== */
+annotationCanvas.addEventListener(
+    "pointerup",
+    finishPointer
+);
 
-function clearAnnotations() {
+annotationCanvas.addEventListener(
+    "pointercancel",
+    finishPointer
+);
 
-    annotation.boxes = [];
 
-    annotation.current = null;
+window.addEventListener(
+    "resize",
+    function() {
+        resizeCanvas();
+    }
+);
 
-    annotation.drawing = false;
 
-    redrawAnnotations();
+function undoLastBox() {
 
-    updateAnnotationInfo();
+    if (
+        annotation.boxes.length
+    ) {
+
+        annotation.boxes.pop();
+
+        document.getElementById(
+            "boxCount"
+        ).textContent =
+            annotation.boxes.length;
+
+        drawCanvas();
+    }
+}
+
+
+function clearBoxes() {
+
+    annotation.boxes =
+        [];
 
     document.getElementById(
-        "annotationMessage"
+        "boxCount"
     ).textContent =
-        "All boxes cleared. Draw again.";
+        "0";
+
+    drawCanvas();
 }
 
-
-/* ========================================================
-   SAVE YOLO LABELS
-======================================================== */
 
 async function saveAnnotations() {
 
-    const message =
+    if (
+        !annotation.filename
+    ) {
+
+        alert(
+            "Choose an image first."
+        );
+
+        return;
+    }
+
+    if (
+        annotation.boxes.length === 0
+    ) {
+
+        alert(
+            "Draw at least one bucket box."
+        );
+
+        return;
+    }
+
+    const msg =
         document.getElementById(
             "annotationMessage"
         );
 
-    if (!annotation.filename) {
+    msg.className =
+        "status";
 
-        message.className =
-            "message error";
-
-        message.textContent =
-            "No image selected.";
-
-        return;
-    }
-
-    if (!annotation.boxes.length) {
-
-        message.className =
-            "message error";
-
-        message.textContent =
-            "Draw at least one bucket box first.";
-
-        return;
-    }
-
-    const canvas =
-        document.getElementById(
-            "annotationCanvas"
-        );
-
-    const boxes =
-        annotation.boxes.map(
-            function(box) {
-
-                const x1 =
-                    Math.min(
-                        box.x1,
-                        box.x2
-                    );
-
-                const y1 =
-                    Math.min(
-                        box.y1,
-                        box.y2
-                    );
-
-                const x2 =
-                    Math.max(
-                        box.x1,
-                        box.x2
-                    );
-
-                const y2 =
-                    Math.max(
-                        box.y1,
-                        box.y2
-                    );
-
-                return {
-                    x_center:
-                        ((x1 + x2) / 2)
-                        / canvas.width,
-
-                    y_center:
-                        ((y1 + y2) / 2)
-                        / canvas.height,
-
-                    width:
-                        (x2 - x1)
-                        / canvas.width,
-
-                    height:
-                        (y2 - y1)
-                        / canvas.height
-                };
-
-            }
-        );
+    msg.textContent =
+        "Saving YOLO labels...";
 
     try {
 
-        message.className =
-            "message";
-
-        message.textContent =
-            "Saving YOLO labels...";
-
         const data =
-            await apiJSON(
+            await api(
                 "/api/dataset/labels",
                 {
                     method: "POST",
+
                     headers: {
                         "Content-Type":
                             "application/json"
                     },
-                    body: JSON.stringify({
-                        filename:
-                            annotation.filename,
 
-                        split:
-                            annotation.split,
+                    body:
+                        JSON.stringify({
+                            filename:
+                                annotation.filename,
 
-                        boxes:
-                            boxes
-                    })
+                            split:
+                                annotation.split,
+
+                            boxes:
+                                annotation.boxes
+                        })
                 }
             );
 
-        message.className =
-            "message ok";
+        msg.className =
+            "status success";
 
-        message.textContent =
-            "Saved successfully: "
-            + data.label_filename
-            + " | "
-            + annotation.boxes.length
-            + " bucket(s).";
+        msg.textContent =
+            "Saved successfully: " +
+            data.filename +
+            " | " +
+            data.boxes +
+            " bucket(s).";
 
-        await loadDatasetStats();
+        await loadDataset();
 
-        await loadTrainingImages();
+        await loadDatasetImages();
 
-    } catch (error) {
+    }
 
-        message.className =
-            "message error";
+    catch(error) {
 
-        message.textContent =
+        msg.className =
+            "status error";
+
+        msg.textContent =
             error.message;
     }
 }
 
 
-/* ========================================================
-   DATASET STATS
-======================================================== */
-
-async function loadDatasetStats() {
-
-    const container =
-        document.getElementById(
-            "datasetStats"
-        );
-
-    try {
-
-        const data =
-            await apiJSON(
-                "/api/dataset/stats"
-            );
-
-        const s = data.stats;
-
-        container.innerHTML = `
-            <div class="grid">
-
-                <div class="stat">
-                    Training Images
-                    <strong>
-                        ${s.training_images}
-                    </strong>
-                </div>
-
-                <div class="stat">
-                    Validation Images
-                    <strong>
-                        ${s.validation_images}
-                    </strong>
-                </div>
-
-                <div class="stat">
-                    Training Labels
-                    <strong>
-                        ${s.training_labels}
-                    </strong>
-                </div>
-
-                <div class="stat">
-                    Validation Labels
-                    <strong>
-                        ${s.validation_labels}
-                    </strong>
-                </div>
-
-            </div>
-
-            <div class="message warning">
-                Unlabeled Training Images:
-                <strong>
-                    ${s.training_unlabeled}
-                </strong>
-                <br>
-                Unlabeled Validation Images:
-                <strong>
-                    ${s.validation_unlabeled}
-                </strong>
-            </div>
-        `;
-
-    } catch (error) {
-
-        container.innerHTML =
-            '<div class="message error">'
-            + error.message
-            + "</div>";
-    }
-}
-
-
-/* ========================================================
-   TRAINING
-======================================================== */
-
-async function startTraining() {
-
-    const button =
-        document.getElementById(
-            "startTrainingButton"
-        );
-
-    try {
-
-        button.disabled = true;
-
-        const data =
-            await apiJSON(
-                "/api/training/start",
-                {
-                    method: "POST"
-                }
-            );
-
-        alert(data.message);
-
-        loadTrainingStatus();
-
-    } catch (error) {
-
-        alert(error.message);
-
-        button.disabled = false;
-    }
-}
-
+/* =========================================================
+   TRAINING STATUS
+========================================================= */
 
 async function loadTrainingStatus() {
+
+    try {
+
+        const data =
+            await api(
+                "/api/training/status"
+            );
+
+        renderTrainingStatus(
+            data
+        );
+
+        if (
+            [
+                "preparing",
+                "loading_model",
+                "training",
+                "saving"
+            ].includes(
+                data.status
+            )
+        ) {
+
+            startTrainingPolling();
+
+        }
+        else {
+
+            stopTrainingPolling();
+
+        }
+
+    }
+
+    catch(error) {
+
+        console.error(
+            error
+        );
+    }
+}
+
+
+function renderTrainingStatus(
+    data
+) {
 
     const status =
         document.getElementById(
@@ -3299,145 +3296,507 @@ async function loadTrainingStatus() {
             "trainingProgress"
         );
 
+    const epochText =
+        document.getElementById(
+            "epochText"
+        );
+
     const button =
         document.getElementById(
             "startTrainingButton"
         );
 
-    try {
+    let className =
+        "status";
 
-        const data =
-            await apiJSON(
-                "/api/training/status"
-            );
+    if (
+        data.status === "training" ||
+        data.status === "preparing" ||
+        data.status === "loading_model" ||
+        data.status === "saving"
+    ) {
 
-        const s =
-            data.training;
+        className =
+            "status training";
 
-        status.textContent =
-            "Status: "
-            + s.status
-            + " | "
-            + s.message;
+    }
 
-        progress.textContent =
-            "Progress: "
-            + s.progress
-            + "%";
+    else if (
+        data.status === "completed"
+    ) {
 
-        if (s.status === "training") {
+        className =
+            "status success";
 
-            button.disabled = true;
+    }
 
-            setTimeout(
-                loadTrainingStatus,
-                2500
-            );
+    else if (
+        data.status === "error"
+    ) {
 
-        } else {
+        className =
+            "status error";
+    }
 
-            button.disabled = false;
-        }
+    status.className =
+        className;
 
-    } catch (error) {
+    status.textContent =
+        "Status: " +
+        data.status +
+        " | " +
+        data.message;
 
-        status.textContent =
-            error.message;
+    if (
+        data.error
+    ) {
 
-        button.disabled = false;
+        status.textContent +=
+            " Error: " +
+            data.error;
+    }
+
+    const pct =
+        Number(
+            data.progress || 0
+        );
+
+    progress.style.width =
+        pct + "%";
+
+    progress.textContent =
+        pct + "%";
+
+    epochText.textContent =
+        "Epoch: " +
+        (data.epoch || 0) +
+        " / " +
+        (data.epochs || 20);
+
+    if (
+        [
+            "preparing",
+            "loading_model",
+            "training",
+            "saving"
+        ].includes(
+            data.status
+        )
+    ) {
+
+        button.disabled =
+            true;
+
+        button.textContent =
+            "Training in progress...";
+
+    }
+
+    else {
+
+        button.disabled =
+            false;
+
+        button.textContent =
+            "Start YOLO Training";
     }
 }
 
 
-/* ========================================================
-   HISTORY
-======================================================== */
+function startTrainingPolling() {
 
-async function loadHistory() {
+    if (trainingPoller) {
+        return;
+    }
 
-    const body =
-        document.getElementById(
-            "historyBody"
+    trainingPoller =
+        setInterval(
+            loadTrainingStatus,
+            1500
+        );
+}
+
+
+function stopTrainingPolling() {
+
+    if (trainingPoller) {
+
+        clearInterval(
+            trainingPoller
         );
 
-    body.innerHTML =
-        "<tr><td colspan='5'>Loading...</td></tr>";
+        trainingPoller =
+            null;
+    }
+}
+
+
+async function startTraining() {
 
     try {
 
         const data =
-            await apiJSON(
-                "/api/history"
+            await api(
+                "/api/training/start",
+                {
+                    method: "POST"
+                }
             );
 
-        if (!data.history.length) {
+        renderTrainingStatus({
+            status: "preparing",
+            message:
+                data.message ||
+                "Starting YOLO training...",
+            progress: 1,
+            epoch: 0,
+            epochs: 20,
+            error: ""
+        });
 
-            body.innerHTML =
-                "<tr><td colspan='5'>No records.</td></tr>";
+        startTrainingPolling();
+
+        // Immediately refresh
+        // so user sees actual server state
+        setTimeout(
+            loadTrainingStatus,
+            500
+        );
+
+    }
+
+    catch(error) {
+
+        renderTrainingStatus({
+            status: "error",
+            message: "Training failed to start.",
+            progress: 0,
+            epoch: 0,
+            epochs: 20,
+            error:
+                error.message
+        });
+    }
+}
+
+
+/* =========================================================
+   REFERENCES
+========================================================= */
+
+document
+    .getElementById(
+        "referenceForm"
+    )
+    .addEventListener(
+        "submit",
+        async function(e) {
+
+            e.preventDefault();
+
+            const file =
+                document.getElementById(
+                    "referenceFile"
+                ).files[0];
+
+            if (!file) {
+                return;
+            }
+
+            const form =
+                new FormData();
+
+            form.append(
+                "file",
+                file
+            );
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/reference/upload",
+                        {
+                            method: "POST",
+                            body: form
+                        }
+                    );
+
+                alert(
+                    data.message ||
+                    "Reference uploaded."
+                );
+
+                loadReferences();
+
+            }
+
+            catch(error) {
+
+                alert(
+                    error.message
+                );
+            }
+        }
+    );
+
+
+async function loadReferences() {
+
+    const container =
+        document.getElementById(
+            "referenceList"
+        );
+
+    try {
+
+        const data =
+            await api(
+                "/api/reference/list"
+            );
+
+        if (
+            !data.images ||
+            data.images.length === 0
+        ) {
+
+            container.innerHTML =
+                '<div class="empty">' +
+                'No reference photos yet.' +
+                '</div>';
 
             return;
         }
 
-        body.innerHTML = "";
+        container.innerHTML =
+            "";
 
-        data.history.forEach(
-            function(row) {
+        data.images.forEach(
+            filename => {
 
-                const tr =
+                const img =
                     document.createElement(
-                        "tr"
+                        "img"
                     );
 
-                const values = [
-                    row.id,
-                    row.bucket_count,
-                    row.count_date || "",
-                    row.shift || "",
-                    row.created_at || ""
-                ];
+                img.src =
+                    "/api/reference/image?filename=" +
+                    encodeURIComponent(
+                        filename
+                    );
 
-                values.forEach(
-                    function(value) {
+                img.style.width =
+                    "160px";
 
-                        const td =
-                            document.createElement(
-                                "td"
-                            );
+                img.style.height =
+                    "120px";
 
-                        td.textContent =
-                            value;
+                img.style.objectFit =
+                    "cover";
 
-                        tr.appendChild(td);
+                img.style.margin =
+                    "5px";
 
-                    }
+                img.style.borderRadius =
+                    "8px";
+
+                container.appendChild(
+                    img
                 );
-
-                body.appendChild(tr);
-
             }
         );
 
-    } catch (error) {
+    }
 
-        body.innerHTML =
-            "<tr><td colspan='5'>"
-            + error.message
-            + "</td></tr>";
+    catch(error) {
+
+        container.innerHTML =
+            escapeHtml(
+                error.message
+            );
     }
 }
 
 
-/* ========================================================
+/* =========================================================
+   HISTORY
+========================================================= */
+
+async function loadHistory() {
+
+    const container =
+        document.getElementById(
+            "historyTable"
+        );
+
+    try {
+
+        const data =
+            await api(
+                "/api/history"
+            );
+
+        if (
+            !data.history ||
+            data.history.length === 0
+        ) {
+
+            container.innerHTML =
+                '<div class="empty">' +
+                'No bucket history yet.' +
+                '</div>';
+
+            return;
+        }
+
+        let html = `
+
+            <table>
+
+                <thead>
+
+                    <tr>
+
+                        <th>
+                            ID
+                        </th>
+
+                        <th>
+                            Buckets
+                        </th>
+
+                        <th>
+                            Shift
+                        </th>
+
+                        <th>
+                            Date
+                        </th>
+
+                    </tr>
+
+                </thead>
+
+                <tbody>
+
+        `;
+
+        data.history.forEach(
+            row => {
+
+                html += `
+
+                    <tr>
+
+                        <td>
+                            ${row.id}
+                        </td>
+
+                        <td>
+                            ${row.bucket_count}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                row.shift_name ||
+                                ""
+                            )}
+                        </td>
+
+                        <td>
+                            ${escapeHtml(
+                                row.recorded_at ||
+                                ""
+                            )}
+                        </td>
+
+                    </tr>
+
+                `;
+            }
+        );
+
+        html += `
+                </tbody>
+            </table>
+        `;
+
+        container.innerHTML =
+            html;
+
+    }
+
+    catch(error) {
+
+        container.innerHTML =
+            '<div class="status error">' +
+            escapeHtml(
+                error.message
+            ) +
+            '</div>';
+    }
+}
+
+
+/* =========================================================
+   MODEL CHECK
+========================================================= */
+
+async function checkModel() {
+
+    const box =
+        document.getElementById(
+            "cameraStatus"
+        );
+
+    try {
+
+        const data =
+            await api(
+                "/api/model/status"
+            );
+
+        if (data.ready) {
+
+            box.className =
+                "status success";
+
+            box.textContent =
+                "AI model ready: " +
+                data.model;
+
+        }
+
+        else {
+
+            box.className =
+                "status";
+
+            box.textContent =
+                "AI model is not ready. " +
+                "Train the model first.";
+        }
+
+    }
+
+    catch(error) {
+
+        box.className =
+            "status error";
+
+        box.textContent =
+            error.message;
+    }
+}
+
+
+/* =========================================================
    INITIAL LOAD
-======================================================== */
+========================================================= */
 
-loadDashboard();
-
-loadDatasetStats();
+loadDataset();
 
 loadTrainingStatus();
-
-loadTrainingImages();
 
 </script>
 
@@ -3453,7 +3812,11 @@ loadTrainingImages();
 
 class Handler(BaseHTTPRequestHandler):
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args
+    ):
         print(
             "%s - %s"
             % (
@@ -3463,393 +3826,277 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-    # ========================================================
-    # RESPONSE HELPERS
-    # ========================================================
-
-    def send_json(
-        self,
-        data,
-        status=200
-    ):
-
-        body = json.dumps(
-            data,
-            default=str
-        ).encode("utf-8")
-
-        self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-store"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(body)
-
-
-    def send_text(
-        self,
-        text,
-        status=200,
-        content_type="text/plain; charset=utf-8"
-    ):
-
-        body = text.encode("utf-8")
-
-        self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            content_type
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-
-        self.end_headers()
-
-        self.wfile.write(body)
-
-
-    def send_file(
-        self,
-        path,
-        content_type=None
-    ):
-
-        if not os.path.isfile(path):
-
-            self.send_error(
-                404,
-                "File not found"
-            )
-
-            return
-
-        size = os.path.getsize(path)
-
-        if content_type is None:
-            content_type =  content_type_for(path)
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            content_type
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(size)
-        )
-
-        self.send_header(
-            "Cache-Control",
-            "no-cache"
-        )
-
-        self.end_headers()
-
-        with open(path, "rb") as f:
-
-            while True:
-
-                chunk = f.read(1024 * 64)
-
-                if not chunk:
-                    break
-
-                self.wfile.write(chunk)
-
-
-    def read_json(self):
-
-        length = int(
-            self.headers.get(
-                "Content-Length",
-                "0"
-            )
-        )
-
-        if length > 5 * 1024 * 1024:
-            raise ValueError(
-                "Request too large."
-            )
-
-        body = self.rfile.read(length)
-
-        if not body:
-            return {}
-
-        return json.loads(
-            body.decode("utf-8")
-        )
-
-
-    # ========================================================
-    # GET
-    # ========================================================
-
     def do_GET(self):
 
         try:
 
-            parsed =   urlparse(self.path)
+            parsed =    urlparse(
+                    self.path
+                )
 
-            path =parsed.path
+            path =   parsed.path
 
-            # -----------------------------
-            # MAIN APP
-            # -----------------------------
+            query =   parse_qs(
+                    parsed.query
+                )
+
+            # --------------------------------------------
+            # Main page
+            # --------------------------------------------
 
             if path == "/":
+                send_html(
+                    self,
+                    HTML_PAGE
+                )
+                return
 
-                self.send_text(
-                    HTML_PAGE,
-                    200,
-                    "text/html; charset=utf-8"
+
+            # --------------------------------------------
+            # Dataset stats
+            # --------------------------------------------
+
+            if path == "/api/dataset/stats":
+
+                send_json(
+                    self,
+                    dataset_stats()
                 )
 
                 return
 
 
-            # -----------------------------
-            # DASHBOARD
-            # -----------------------------
+            # --------------------------------------------
+            # Dataset image list
+            # --------------------------------------------
 
-            if path == "/api/dashboard":
+            if path == "/api/dataset/images":
 
-                dashboard =  get_dashboard_data()
-
-                self.send_json({
-                    "ok": True,
-                    **dashboard,
-                    "model":
-                        trained_model_exists()
-                })
-
-                return
-
-
-            # -----------------------------
-            # HISTORY
-            # -----------------------------
-
-            if path == "/api/history":
-
-                history =  get_history()
-
-                self.send_json({
-                    "ok": True,
-                    "history": history
-                })
-
-                return
-
-
-            # -----------------------------
-            # DATASET STATS
-            # -----------------------------
-
-            if path == "/api/dataset/stats":
-
-                self.send_json({
-                    "ok": True,
-                    "stats":
-                        dataset_stats()
-                })
-
-                return
-
-
-            # -----------------------------
-            # DATASET IMAGE LIST
-            # -----------------------------
-
-            if path == "/api/dataset/list":
-
-                query =  parse_qs(
-                        parsed.query
-                    )
-
-                split =  query.get(
+                split =   query.get(
                         "split",
                         ["train"]
                     )[0]
 
-                if split not in (
-                    "train",
-                    "val"
-                ):
-                    split = "train"
+                split =    "val" if split == "val" else "train"
 
-                self.send_json({
-                    "ok": True,
-                    "images":
-                        dataset_image_list(split)
-                })
+                image_dir, label_dir =  split_dirs(split)
+
+                images = []
+
+                for filename in image_files_in(
+                    image_dir
+                ):
+
+                    images.append({
+                        "filename": filename,
+                        "split": split,
+                        "labeled":
+                            image_has_label(
+                                split,
+                                filename
+                            )
+                    })
+
+                send_json(
+                    self,
+                    {
+                        "images": images
+                    }
+                )
 
                 return
 
 
-            # -----------------------------
-            # DATASET IMAGE
-            # -----------------------------
+            # --------------------------------------------
+            # Dataset image
+            # --------------------------------------------
 
-            if path.startswith("/dataset/"):
+            if path == "/api/dataset/image":
 
-                parts = path.split("/")
+                split =   query.get(
+                        "split",
+                        ["train"]
+                    )[0]
 
-                if len(parts) < 4:
+                filename =    query.get(
+                        "filename",
+                        [""]
+                    )[0]
 
-                    self.send_error(
-                        404
+                split =    "val" if split == "val" else "train"
+
+                image_path =   image_path_for(
+                        split,
+                        filename
                     )
 
-                    return
-
-                split =  parts[2]
-
-                filename =  safe_filename(
-                        parts[3]
-                    )
-
-                if split == "train":
-
-                    image_path =  os.path.join(
-                            TRAIN_IMAGES_DIR,
-                            filename
-                        )
-
-                elif split == "val":
-
-                    image_path =   os.path.join(
-                            VAL_IMAGES_DIR,
-                            filename
-                        )
-
-                else:
-
-                    self.send_error(
-                        404
-                    )
-
-                    return
-
-                self.send_file(
+                send_file(
+                    self,
                     image_path
                 )
 
                 return
 
 
-            # -----------------------------
-            # REFERENCES
-            # -----------------------------
+            # --------------------------------------------
+            # Dataset labels
+            # --------------------------------------------
 
-            if path == "/api/references":
+            if path == "/api/dataset/labels":
 
-                refs = []
+                split =  query.get(
+                        "split",
+                        ["train"]
+                    )[0]
 
-                for filename in sorted(
-                    os.listdir(
-                        REFERENCE_DIR
-                    )
-                ):
+                filename =  query.get(
+                        "filename",
+                        [""]
+                    )[0]
 
-                    if not is_image(filename):
-                        continue
-
-                    refs.append({
-                        "filename": filename,
-                        "url":
-                            "/references/"
-                            + filename
-                    })
-
-                self.send_json({
-                    "ok": True,
-                    "references": refs
-                })
-
-                return
-
-
-            # -----------------------------
-            # REFERENCE FILE
-            # -----------------------------
-
-            if path.startswith(
-                "/references/"
-            ):
-
-                filename =safe_filename(
-                        path.split(
-                            "/references/",
-                            1
-                        )[1]
-                    )
-
-                file_path =   os.path.join(
-                        REFERENCE_DIR,
+                boxes =  read_yolo_labels(
+                        split,
                         filename
                     )
 
-                self.send_file(
-                    file_path
+                send_json(
+                    self,
+                    {
+                        "filename": filename,
+                        "split": split,
+                        "boxes": boxes
+                    }
                 )
 
                 return
 
 
-            # -----------------------------
-            # TRAINING STATUS
-            # -----------------------------
+            # --------------------------------------------
+            # Training status
+            # --------------------------------------------
 
             if path == "/api/training/status":
 
-                self.send_json({
-                    "ok": True,
-                    "training":
-                        TRAINING_STATE
-                })
+                with TRAINING_LOCK:
+
+                    state =   dict(
+                            TRAINING_STATE
+                        )
+
+                send_json(
+                    self,
+                    state
+                )
 
                 return
 
 
-            # -----------------------------
-            # HEALTH
-            # -----------------------------
+            # --------------------------------------------
+            # Reference list
+            # --------------------------------------------
 
-            if path == "/health":
+            if path == "/api/reference/list":
 
-                self.send_json({
-                    "ok": True,
-                    "service":
-                        "NEERIKA BUCKET AI"
-                })
+                images = []
+
+                if os.path.isdir(
+                    REFERENCE_DIR
+                ):
+
+                    for filename in sorted(
+                        os.listdir(
+                            REFERENCE_DIR
+                        )
+                    ):
+
+                        if is_image_file(
+                            filename
+                        ):
+
+                            images.append(
+                                filename
+                            )
+
+                send_json(
+                    self,
+                    {
+                        "images": images
+                    }
+                )
+
+                return
+
+
+            # --------------------------------------------
+            # Reference image
+            # --------------------------------------------
+
+            if path == "/api/reference/image":
+
+                filename =   query.get(
+                        "filename",
+                        [""]
+                    )[0]
+
+                path =   os.path.join(
+                        REFERENCE_DIR,
+                        safe_filename(
+                            filename
+                        )
+                    )
+
+                send_file(
+                    self,
+                    path
+                )
+
+                return
+
+
+            # --------------------------------------------
+            # History
+            # --------------------------------------------
+
+            if path == "/api/history":
+
+                send_json(
+                    self,
+                    {
+                        "history":
+                            get_bucket_history()
+                    }
+                )
+
+                return
+
+
+            # --------------------------------------------
+            # Model status
+            # --------------------------------------------
+
+            if path == "/api/model/status":
+
+                ready =  os.path.exists(
+                        MODEL_OUTPUT
+                    )
+
+                send_json(
+                    self,
+                    {
+                        "ready": ready,
+                        "model":
+                            MODEL_OUTPUT
+                        if ready
+                        else ""
+                    }
+                )
 
                 return
 
 
             self.send_error(
                 404,
-                "Not found"
+                "Not Found"
             )
 
         except Exception as e:
@@ -3858,10 +4105,10 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                self.send_json(
+                send_json(
+                    self,
                     {
-                        "ok": False,
-                        "message": str(e)
+                        "error": str(e)
                     },
                     500
                 )
@@ -3870,201 +4117,66 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
-    # ========================================================
-    # POST
-    # ========================================================
-
     def do_POST(self):
 
         try:
 
-            parsed =urlparse(self.path)
+            parsed =  urlparse(
+                    self.path
+                )
 
             path =  parsed.path
 
 
             # =================================================
-            # SAVE COUNT
-            # =================================================
-
-            if path == "/api/count":
-
-                data = self.read_json()
-
-                count =   int(
-                        data.get(
-                            "count",
-                            0
-                        )
-                    )
-
-                shift =str(
-                        data.get(
-                            "shift",
-                            "A"
-                        )
-                    )
-
-                if count < 0:
-                    raise ValueError(
-                        "Count cannot be negative."
-                    )
-
-                if count > 10000:
-                    raise ValueError(
-                        "Count is too large."
-                    )
-
-                saved =  save_bucket_count(
-                        count,
-                        shift
-                    )
-
-                if not saved:
-
-                    raise RuntimeError(
-                        "Failed to save count to database."
-                    )
-
-                self.send_json({
-                    "ok": True,
-                    "message":
-                        "Bucket count saved.",
-                    "count":
-                        count
-                })
-
-                return
-
-
-            # =================================================
-            # REFERENCE UPLOAD
-            # =================================================
-
-            if path == "/api/reference/upload":
-
-                files = parse_multipart(self)
-
-                image_file = None
-
-                for item in files:
-
-                    if item["field"] == "image":
-                        image_file = item
-                        break
-
-                if image_file is None:
-                    raise ValueError(
-                        "No image uploaded."
-                    )
-
-                filename =  unique_filename(
-                        image_file["filename"]
-                    )
-
-                if not is_image(filename):
-                    raise ValueError(
-                        "Only image files are allowed."
-                    )
-
-                destination = os.path.join(
-                        REFERENCE_DIR,
-                        filename
-                    )
-
-                with open(
-                    destination,
-                    "wb"
-                ) as f:
-
-                    f.write(
-                        image_file["data"]
-                    )
-
-                self.send_json({
-                    "ok": True,
-                    "message":
-                        "Reference photo uploaded.",
-                    "filename":
-                        filename
-                })
-
-                return
-
-
-            # =================================================
-            # DATASET IMAGE UPLOAD
+            # DATASET UPLOAD
             # =================================================
 
             if path == "/api/dataset/upload":
 
-                files =   parse_multipart(self)
-
-                image_file = None
-                split = "train"
-
-                for item in files:
-
-                    if item["field"] == "image":
-                        image_file = item
-
-                # Read split from normal multipart field
-                # if browser sent it as a non-file part.
-                #
-                # The simple multipart parser above focuses
-                # on files, so infer train by default.
-                #
-                # Frontend sends split through query too
-                # in the fallback below.
-
-                query =   parse_qs(
-                        parsed.query
+                fields, files =  parse_multipart(
+                        self
                     )
 
-                if query.get("split"):
-                    split =query["split"][0]
-
-                # Because browser sends split as multipart
-                # field, inspect the raw request is not
-                # available anymore here. The frontend
-                # therefore also gets the split from a
-                # custom header.
-
-                header_split =  self.headers.get(
-                        "X-Dataset-Split",
-                        ""
-                    )
-
-                if header_split in (
-                    "train",
-                    "val"
-                ):
-                    split = header_split
-
-                if split not in (
-                    "train",
-                    "val"
-                ):
-                    split = "train"
-
-                if image_file is None:
+                if not files:
                     raise ValueError(
-                        "No image uploaded."
+                        "No image file uploaded."
                     )
 
-                filename =unique_filename(
-                        image_file["filename"]
-                    )
+                file_info = files[0]
 
-                if not is_image(filename):
+                original_filename = file_info["filename"]
+
+                if not is_image_file(
+                    original_filename
+                ):
+
                     raise ValueError(
                         "Only JPG, JPEG, PNG and WEBP images are allowed."
                     )
 
-                images_dir, labels_dir = get_split_dirs(split)
+                split =   fields.get(
+                        "split",
+                        "train"
+                    ).strip().lower()
 
-                destination = os.path.join(
-                        images_dir,
+                if split not in {
+                    "train",
+                    "val"
+                }:
+
+                    split = "train"
+
+                image_dir, label_dir =  split_dirs(
+                        split
+                    )
+
+                filename =  unique_filename(
+                        original_filename
+                    )
+
+                destination =   os.path.join(
+                        image_dir,
                         filename
                     )
 
@@ -4074,82 +4186,52 @@ class Handler(BaseHTTPRequestHandler):
                 ) as f:
 
                     f.write(
-                        image_file["data"]
+                        file_info["data"]
                     )
 
-                self.send_json({
-                    "ok": True,
-                    "message":
-                        "Training image uploaded.",
-                    "filename":
-                        filename,
-                    "split":
-                        split,
-                    "url":
-                        "/dataset/"
-                        + split
-                        + "/"
-                        + filename
-                })
+                send_json(
+                    self,
+                    {
+                        "success": True,
+                        "filename": filename,
+                        "split": split,
+                        "url":
+                            "/api/dataset/image?split=" +
+                            split +
+                            "&filename=" +
+                            filename
+                    }
+                )
 
                 return
 
 
             # =================================================
-            # SAVE MULTIPLE YOLO LABELS
+            # SAVE LABELS
             # =================================================
 
             if path == "/api/dataset/labels":
 
-                data = self.read_json()
-
-                filename = data.get(
-                        "filename"
+                content_length = int(
+                        self.headers.get(
+                            "Content-Length",
+                            "0"
+                        )
                     )
 
-                split =  data.get(
-                        "split",
-                        "train"
+                body =  self.rfile.read(
+                        content_length
                     )
 
-                boxes =  data.get(
-                        "boxes"
+                data = json.loads(
+                        body.decode(
+                            "utf-8"
+                        )
                     )
 
-                if not filename:
-                    raise ValueError(
-                        "filename is required."
-                    )
-
-                label_filename =  save_yolo_labels(
-                        filename,
-                        boxes,
-                        split
-                    )
-
-                self.send_json({
-                    "ok": True,
-                    "message":
-                        "YOLO labels saved successfully.",
-                    "label_filename":
-                        label_filename,
-                    "box_count":
-                        len(boxes)
-                })
-
-                return
-
-
-            # =================================================
-            # LEGACY SINGLE LABEL API
-            # =================================================
-
-            if path == "/api/dataset/label":
-
-                data = self.read_json()
-
-                filename =  data.get(
-                        "filename"
+                filename =    data.get(
+                        "filename",
+                        ""
                     )
 
                 split = data.get(
@@ -4157,30 +4239,34 @@ class Handler(BaseHTTPRequestHandler):
                         "train"
                     )
 
-                boxes = [{
-                    "x_center":
-                        data.get("x_center"),
-                    "y_center":
-                        data.get("y_center"),
-                    "width":
-                        data.get("width"),
-                    "height":
-                        data.get("height"),
-                }]
-
-                label_filename =  save_yolo_labels(
-                        filename,
-                        boxes,
-                        split
+                boxes = data.get(
+                        "boxes",
+                        []
                     )
 
-                self.send_json({
-                    "ok": True,
-                    "message":
-                        "YOLO label saved.",
-                    "label_filename":
-                        label_filename
-                })
+                if not filename:
+                    raise ValueError(
+                        "Filename missing."
+                    )
+
+                if not boxes:
+                    raise ValueError(
+                        "No annotation boxes."
+                    )
+
+                result =   save_yolo_labels(
+                        split,
+                        filename,
+                        boxes
+                    )
+
+                send_json(
+                    self,
+                    {
+                        "success": True,
+                        **result
+                    }
+                )
 
                 return
 
@@ -4193,9 +4279,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 result =  start_training()
 
-                self.send_json(
+                send_json(
+                    self,
                     result,
-                    200 if result["ok"]
+                    200
+                    if result["success"]
                     else 409
                 )
 
@@ -4203,90 +4291,140 @@ class Handler(BaseHTTPRequestHandler):
 
 
             # =================================================
-            # DETECT
+            # REFERENCE UPLOAD
             # =================================================
 
-            if path == "/api/detect":
+            if path == "/api/reference/upload":
 
-                files =  parse_multipart(self)
+                fields, files = parse_multipart(
+                        self
+                    )
 
-                image_file = None
-
-                for item in files:
-
-                    if item["field"] == "image":
-                        image_file = item
-                        break
-
-                if image_file is None:
+                if not files:
                     raise ValueError(
-                        "No image uploaded."
+                        "No reference image uploaded."
                     )
 
-                result =   detect_image(
-                        image_file["data"]
+                file_info =files[0]
+
+                original =  file_info["filename"]
+
+                if not is_image_file(
+                    original
+                ):
+
+                    raise ValueError(
+                        "Invalid image format."
                     )
 
-                self.send_json({
-                    "ok": True,
-                    **result
-                })
+                filename =  unique_filename(
+                        original
+                    )
+
+                destination = os.path.join(
+                        REFERENCE_DIR,
+                        filename
+                    )
+
+                with open(
+                    destination,
+                    "wb"
+                ) as f:
+
+                    f.write(
+                        file_info["data"]
+                    )
+
+                send_json(
+                    self,
+                    {
+                        "success": True,
+                        "filename": filename,
+                        "message":
+                            "Reference photo uploaded successfully."
+                    }
+                )
+
+                return
+
+
+            # =================================================
+            # SAVE BUCKET COUNT
+            # =================================================
+
+            if path == "/api/count":
+
+                content_length =  int(
+                        self.headers.get(
+                            "Content-Length",
+                            "0"
+                        )
+                    )
+
+                body =   self.rfile.read(
+                        content_length
+                    )
+
+                data = json.loads(
+                        body.decode(
+                            "utf-8"
+                        )
+                    )
+
+                count =  int(
+                        data.get(
+                            "count",
+                            0
+                        )
+                    )
+
+                shift =   str(
+                        data.get(
+                            "shift",
+                            ""
+                        )
+                    )
+
+                result =  save_bucket_count(
+                        count,
+                        shift
+                    )
+
+                send_json(
+                    self,
+                    result,
+                    200
+                    if result["success"]
+                    else 500
+                )
 
                 return
 
 
             self.send_error(
                 404,
-                "Not found"
+                "Not Found"
             )
 
         except Exception as e:
 
             traceback.print_exc()
 
-            try:
-
-                self.send_json(
-                    {
-                        "ok": False,
-                        "message": str(e)
-                    },
-                    500
-                )
-
-            except Exception:
-                pass
-
-
-# ============================================================
-# FIX DATASET UPLOAD SPLIT HEADER
-# ============================================================
-#
-# The frontend needs to tell the server whether the image
-# belongs to train or val. Patch fetch by intercepting the
-# upload function's request header through the following
-# small replacement.
-#
-# Instead of modifying the large HTML above manually, the
-# backend also accepts X-Dataset-Split.
-#
-# The browser function above sends the multipart form but
-# does not yet add the header. We therefore modify the HTML
-# string before serving it.
-
-
-HTML_PAGE = HTML_PAGE.replace(
-    'method: "POST",\n                    body: form',
-    'method: "POST",\n                    headers: {\n                        "X-Dataset-Split": split\n                    },\n                    body: form',
-    1
-)
+            send_json(
+                self,
+                {
+                    "success": False,
+                    "error": str(e)
+                },
+                500
+            )
 
 
 # ============================================================
 # START SERVER
 # ============================================================
 
-def main():
+if __name__ == "__main__":
 
     print("=" * 60)
     print("NEERIKA BUCKET AI")
@@ -4294,37 +4432,46 @@ def main():
     print("=" * 60)
 
     print(
+        "BASE_DIR:",
+        BASE_DIR
+    )
+
+    print(
+        "DATASET_DIR:",
+        DATASET_DIR
+    )
+
+    print(
+        "MODEL_OUTPUT:",
+        MODEL_OUTPUT
+    )
+
+    print(
+        "YOLO_AVAILABLE:",
+        YOLO_AVAILABLE
+    )
+
+    print(
+        "EPOCHS:",
+        EPOCHS
+    )
+
+    print(
         "PORT:",
         PORT
     )
 
-    print(
-        "DATABASE:",
-        "configured"
-        if DATABASE_URL
-        else "NOT CONFIGURED"
-    )
+    init_db()
 
-    print(
-        "MODEL:",
-        "READY"
-        if trained_model_exists()
-        else "NOT TRAINED"
-    )
+    write_dataset_yaml()
 
-    init_database()
-
-    server =     ThreadingHTTPServer(
+    server =  ThreadingHTTPServer(
             ("0.0.0.0", PORT),
             Handler
         )
 
     print(
-        f"Server running on port {PORT}"
+        f"NEERIKA BUCKET AI running on port {PORT}"
     )
 
     server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
