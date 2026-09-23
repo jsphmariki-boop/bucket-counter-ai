@@ -1,34 +1,21 @@
 import os
 import io
-import csv
 import json
-import base64
 import traceback
-import tempfile
-import shutil
 import threading
-import time
+import shutil
 import uuid
-import random
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================================================
 # NEERIKA BUCKET AI
 # Mining Production Bucket Counter
-# FULL REPLACEMENT app.py
+# FULL app.py
 # ============================================================
 
-# ------------------------------------------------------------
-# ULTRALYTICS CONFIG
-# ------------------------------------------------------------
-
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
-
-# ------------------------------------------------------------
-# OPTIONAL DEPENDENCIES
-# ------------------------------------------------------------
 
 try:
     import psycopg2
@@ -44,24 +31,16 @@ except Exception:
 
 
 # ============================================================
-# BASIC SETTINGS
+# CONFIGURATION
 # ============================================================
-
-APP_NAME = "NEERIKA BUCKET AI"
-APP_SUBTITLE = "Mining Production Bucket Counter"
 
 PORT = int(os.environ.get("PORT", "8080"))
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
-# ------------------------------------------------------------
-# DIRECTORY STRUCTURE
-# ------------------------------------------------------------
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-AI_DIR = os.path.join(BASE_DIR, "ai")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
+AI_DIR = os.path.join(BASE_DIR, "ai")
 DATASET_DIR = os.path.join(AI_DIR, "dataset")
 
 IMAGES_DIR = os.path.join(DATASET_DIR, "images")
@@ -75,21 +54,13 @@ VAL_LABELS_DIR = os.path.join(LABELS_DIR, "val")
 
 MODELS_DIR = os.path.join(AI_DIR, "models")
 
-UPLOAD_DIR = os.path.join(BASE_DIR, "bucket_images")
-
 REFERENCE_DIR = os.path.join(BASE_DIR, "reference_images")
 
-TEMP_DIR = os.path.join(BASE_DIR, "tmp")
+UPLOAD_DIR = os.path.join(BASE_DIR, "bucket_images")
 
-YOLO_DATASET_YAML = os.path.join(DATASET_DIR, "dataset.yaml")
-
-# ------------------------------------------------------------
-# MODEL
-# ------------------------------------------------------------
-
-DEFAULT_MODEL = os.environ.get(
-    "YOLO_MODEL",
-    "yolo11n.pt"
+YOLO_YAML = os.path.join(
+    DATASET_DIR,
+    "dataset.yaml"
 )
 
 TRAINED_MODEL = os.path.join(
@@ -97,11 +68,17 @@ TRAINED_MODEL = os.path.join(
     "bucket_best.pt"
 )
 
+DEFAULT_MODEL = os.environ.get(
+    "YOLO_MODEL",
+    "yolo11n.pt"
+)
+
+
 # ============================================================
-# CREATE ALL REQUIRED DIRECTORIES
+# CREATE DIRECTORIES
 # ============================================================
 
-REQUIRED_DIRECTORIES = [
+DIRECTORIES = [
     AI_DIR,
     DATASET_DIR,
     IMAGES_DIR,
@@ -111,20 +88,16 @@ REQUIRED_DIRECTORIES = [
     TRAIN_LABELS_DIR,
     VAL_LABELS_DIR,
     MODELS_DIR,
-    UPLOAD_DIR,
     REFERENCE_DIR,
-    TEMP_DIR,
+    UPLOAD_DIR,
 ]
 
-for directory in REQUIRED_DIRECTORIES:
-    try:
-        os.makedirs(directory, exist_ok=True)
-    except Exception as e:
-        print("DIRECTORY ERROR:", directory, e)
+for directory in DIRECTORIES:
+    os.makedirs(directory, exist_ok=True)
 
 
 # ============================================================
-# GLOBAL TRAINING STATE
+# TRAINING STATE
 # ============================================================
 
 TRAINING_LOCK = threading.Lock()
@@ -139,7 +112,7 @@ TRAINING_STATE = {
     "labels": 0,
     "started_at": None,
     "finished_at": None,
-    "error": None
+    "error": None,
 }
 
 
@@ -147,7 +120,8 @@ TRAINING_STATE = {
 # DATABASE
 # ============================================================
 
-def db_connection():
+def db_connect():
+
     if not DATABASE_URL:
         return None
 
@@ -160,18 +134,20 @@ def db_connection():
             connect_timeout=10
         )
     except Exception as e:
-        print("DATABASE CONNECTION ERROR:", e)
+        print("DATABASE ERROR:", e)
         return None
 
 
 def init_database():
-    conn = db_connection()
+
+    conn = db_connect()
 
     if conn is None:
-        print("DATABASE_URL not available. Running without database.")
+        print("Database not configured.")
         return
 
     try:
+
         cur = conn.cursor()
 
         cur.execute("""
@@ -188,23 +164,22 @@ def init_database():
         """)
 
         conn.commit()
+
         cur.close()
         conn.close()
 
-        print("Database initialized successfully.")
+        print("Database initialized.")
 
     except Exception as e:
-        print("DATABASE INITIALIZATION ERROR:", e)
+
+        print("DATABASE INIT ERROR:", e)
+
         try:
             conn.rollback()
             conn.close()
         except Exception:
             pass
 
-
-# ============================================================
-# DATABASE FUNCTIONS
-# ============================================================
 
 def save_bucket_count(
     bucket_type="default",
@@ -214,12 +189,14 @@ def save_bucket_count(
     source="camera",
     confidence=0
 ):
-    conn = db_connection()
+
+    conn = db_connect()
 
     if conn is None:
         return False
 
     try:
+
         cur = conn.cursor()
 
         cur.execute("""
@@ -232,7 +209,7 @@ def save_bucket_count(
                 source,
                 confidence
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s,%s,%s,%s,%s,%s)
         """, (
             bucket_type,
             int(count),
@@ -250,6 +227,7 @@ def save_bucket_count(
         return True
 
     except Exception as e:
+
         print("SAVE COUNT ERROR:", e)
 
         try:
@@ -261,14 +239,18 @@ def save_bucket_count(
         return False
 
 
-def get_bucket_history(limit=200):
-    conn = db_connection()
+def get_history():
+
+    conn = db_connect()
 
     if conn is None:
         return []
 
     try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        cur = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
 
         cur.execute("""
             SELECT
@@ -282,18 +264,21 @@ def get_bucket_history(limit=200):
                 created_at
             FROM bucket_counts
             ORDER BY created_at DESC
-            LIMIT %s
-        """, (int(limit),))
+            LIMIT 200
+        """)
 
         rows = cur.fetchall()
 
         result = []
 
         for row in rows:
+
             item = dict(row)
 
             if item.get("created_at"):
-                item["created_at"] = item["created_at"].isoformat()
+                item["created_at"] = (
+                    item["created_at"].isoformat()
+                )
 
             result.append(item)
 
@@ -303,6 +288,7 @@ def get_bucket_history(limit=200):
         return result
 
     except Exception as e:
+
         print("HISTORY ERROR:", e)
 
         try:
@@ -314,16 +300,18 @@ def get_bucket_history(limit=200):
 
 
 def get_total_count():
-    conn = db_connection()
+
+    conn = db_connect()
 
     if conn is None:
         return 0
 
     try:
+
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT COALESCE(SUM(count), 0)
+            SELECT COALESCE(SUM(count),0)
             FROM bucket_counts
         """)
 
@@ -334,8 +322,7 @@ def get_total_count():
 
         return int(value or 0)
 
-    except Exception as e:
-        print("TOTAL COUNT ERROR:", e)
+    except Exception:
 
         try:
             conn.close()
@@ -346,7 +333,7 @@ def get_total_count():
 
 
 # ============================================================
-# DATASET FUNCTIONS
+# FILE / DATASET HELPERS
 # ============================================================
 
 IMAGE_EXTENSIONS = {
@@ -359,36 +346,56 @@ IMAGE_EXTENSIONS = {
 
 
 def is_image(filename):
-    extension = os.path.splitext(filename)[1].lower()
+
+    extension = os.path.splitext(
+        filename
+    )[1].lower()
+
     return extension in IMAGE_EXTENSIONS
 
 
 def list_images(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-        return []
+
+    os.makedirs(
+        directory,
+        exist_ok=True
+    )
 
     result = []
 
     for filename in os.listdir(directory):
-        path = os.path.join(directory, filename)
 
-        if os.path.isfile(path) and is_image(filename):
+        path = os.path.join(
+            directory,
+            filename
+        )
+
+        if (
+            os.path.isfile(path)
+            and is_image(filename)
+        ):
             result.append(path)
 
     return result
 
 
 def list_labels(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-        return []
+
+    os.makedirs(
+        directory,
+        exist_ok=True
+    )
 
     result = []
 
     for filename in os.listdir(directory):
+
         if filename.lower().endswith(".txt"):
-            path = os.path.join(directory, filename)
+
+            path = os.path.join(
+                directory,
+                filename
+            )
 
             if os.path.isfile(path):
                 result.append(path)
@@ -398,118 +405,90 @@ def list_labels(directory):
 
 def dataset_statistics():
 
-    train_images = list_images(TRAIN_IMAGES_DIR)
-    val_images = list_images(VAL_IMAGES_DIR)
+    train_images = list_images(
+        TRAIN_IMAGES_DIR
+    )
 
-    train_labels = list_labels(TRAIN_LABELS_DIR)
-    val_labels = list_labels(VAL_LABELS_DIR)
+    val_images = list_images(
+        VAL_IMAGES_DIR
+    )
 
-    all_images = train_images + val_images
-    all_labels = train_labels + val_labels
+    train_labels = list_labels(
+        TRAIN_LABELS_DIR
+    )
+
+    val_labels = list_labels(
+        VAL_LABELS_DIR
+    )
 
     return {
         "train_images": len(train_images),
         "val_images": len(val_images),
         "train_labels": len(train_labels),
         "val_labels": len(val_labels),
-        "images": len(all_images),
-        "labels": len(all_labels)
+        "images": (
+            len(train_images)
+            + len(val_images)
+        ),
+        "labels": (
+            len(train_labels)
+            + len(val_labels)
+        )
     }
 
 
-def make_dataset_yaml():
+def create_dataset_yaml():
 
-    os.makedirs(DATASET_DIR, exist_ok=True)
+    os.makedirs(
+        DATASET_DIR,
+        exist_ok=True
+    )
 
-    # Use forward slashes because YOLO handles them reliably.
-    train_path = TRAIN_IMAGES_DIR.replace("\\", "/")
-    val_path = VAL_IMAGES_DIR.replace("\\", "/")
+    root = DATASET_DIR.replace(
+        "\\",
+        "/"
+    )
 
-    yaml_text = f"""path: {DATASET_DIR.replace("\\", "/")}
-train: {train_path}
-val: {val_path}
-
-names:
-  0: BUCKET_LOADED
-"""
+    yaml_text = (
+        "path: " + root + "\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "\n"
+        "names:\n"
+        "  0: BUCKET_LOADED\n"
+    )
 
     with open(
-        YOLO_DATASET_YAML,
+        YOLO_YAML,
         "w",
         encoding="utf-8"
     ) as f:
+
         f.write(yaml_text)
 
-    return YOLO_DATASET_YAML
-
-
-def validate_dataset():
-
-    stats = dataset_statistics()
-
-    if stats["images"] == 0:
-        return False, (
-            "No training images found. "
-            "Upload at least one bucket image first."
-        ), stats
-
-    if stats["labels"] == 0:
-        return False, (
-            "No YOLO labels found. "
-            "Images must be annotated before training."
-        ), stats
-
-    # Check matching label/image names.
-    image_names = set()
-
-    for directory in [TRAIN_IMAGES_DIR, VAL_IMAGES_DIR]:
-        for path in list_images(directory):
-            image_names.add(
-                os.path.splitext(
-                    os.path.basename(path)
-                )[0]
-            )
-
-    label_names = set()
-
-    for directory in [TRAIN_LABELS_DIR, VAL_LABELS_DIR]:
-        for path in list_labels(directory):
-            label_names.add(
-                os.path.splitext(
-                    os.path.basename(path)
-                )[0]
-            )
-
-    matched = image_names.intersection(label_names)
-
-    if len(matched) == 0:
-        return False, (
-            "Images were found, but no image has a matching YOLO "
-            "label file. Example: bucket001.jpg must have "
-            "bucket001.txt."
-        ), stats
-
-    return True, "Dataset is ready for training.", stats
+    return YOLO_YAML
 
 
 # ============================================================
-# SAVE UPLOADED TRAINING IMAGE
+# UPLOAD IMAGE
 # ============================================================
 
-def save_training_image(filename, data):
+def save_training_image(
+    original_filename,
+    data
+):
 
-    if not filename:
-        filename = "image.jpg"
-
-    original_name = os.path.basename(filename)
-
-    extension = os.path.splitext(original_name)[1].lower()
+    extension = os.path.splitext(
+        original_filename
+    )[1].lower()
 
     if extension not in IMAGE_EXTENSIONS:
         extension = ".jpg"
 
-    safe_name = (
-        datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = (
+        datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
         + "_"
         + uuid.uuid4().hex[:8]
         + extension
@@ -517,155 +496,397 @@ def save_training_image(filename, data):
 
     path = os.path.join(
         TRAIN_IMAGES_DIR,
-        safe_name
+        filename
     )
 
-    with open(path, "wb") as f:
+    with open(
+        path,
+        "wb"
+    ) as f:
+
         f.write(data)
 
-    return safe_name, path
+    return filename
 
 
 # ============================================================
-# REFERENCE BUCKET IMAGES
+# ANNOTATION
 # ============================================================
 
-def save_reference_image(filename, data):
+def save_annotation(
+    filename,
+    boxes
+):
 
-    extension = os.path.splitext(
-        os.path.basename(filename)
-    )[1].lower()
-
-    if extension not in IMAGE_EXTENSIONS:
-        extension = ".jpg"
-
-    safe_name = (
-        datetime.now().strftime("%Y%m%d_%H%M%S")
-        + "_"
-        + uuid.uuid4().hex[:8]
-        + extension
+    image_path = os.path.join(
+        TRAIN_IMAGES_DIR,
+        filename
     )
 
-    path = os.path.join(
-        REFERENCE_DIR,
-        safe_name
+    if not os.path.isfile(
+        image_path
+    ):
+        raise FileNotFoundError(
+            "Training image not found."
+        )
+
+    image_name = os.path.splitext(
+        filename
+    )[0]
+
+    label_filename = (
+        image_name + ".txt"
     )
 
-    with open(path, "wb") as f:
-        f.write(data)
+    label_path = os.path.join(
+        TRAIN_LABELS_DIR,
+        label_filename
+    )
 
-    return safe_name
+    lines = []
+
+    for box in boxes:
+
+        try:
+
+            x = float(box["x"])
+            y = float(box["y"])
+            w = float(box["width"])
+            h = float(box["height"])
+
+        except Exception:
+
+            continue
+
+        # Clamp values
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.0, min(1.0, w))
+        h = max(0.0, min(1.0, h))
+
+        if w <= 0 or h <= 0:
+            continue
+
+        # YOLO:
+        # class center_x center_y width height
+
+        lines.append(
+            "0 %.6f %.6f %.6f %.6f"
+            % (
+                x,
+                y,
+                w,
+                h
+            )
+        )
+
+    if not lines:
+
+        raise ValueError(
+            "No valid annotation boxes supplied."
+        )
+
+    with open(
+        label_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            "\n".join(lines)
+            + "\n"
+        )
+
+    create_dataset_yaml()
+
+    return label_filename
 
 
-def list_reference_images():
-
-    if not os.path.exists(REFERENCE_DIR):
-        os.makedirs(REFERENCE_DIR, exist_ok=True)
+def get_training_images():
 
     result = []
 
-    for filename in os.listdir(REFERENCE_DIR):
+    for path in list_images(
+        TRAIN_IMAGES_DIR
+    ):
 
-        path = os.path.join(
-            REFERENCE_DIR,
-            filename
+        filename = os.path.basename(
+            path
         )
 
-        if os.path.isfile(path) and is_image(filename):
+        label_filename = (
+            os.path.splitext(filename)[0]
+            + ".txt"
+        )
 
-            result.append({
-                "name": filename,
-                "url": "/reference/" + filename
-            })
+        label_exists = os.path.isfile(
+            os.path.join(
+                TRAIN_LABELS_DIR,
+                label_filename
+            )
+        )
+
+        result.append({
+            "filename": filename,
+            "url":
+                "/training-image/"
+                + filename,
+            "annotated":
+                label_exists
+        })
 
     return result
 
 
 # ============================================================
-# YOLO TRAINING
+# VALIDATE DATASET
 # ============================================================
 
-def update_training_state(**kwargs):
+def validate_dataset():
+
+    stats = dataset_statistics()
+
+    if stats["train_images"] == 0:
+
+        return (
+            False,
+            "No training images found. Upload images first.",
+            stats
+        )
+
+    if stats["train_labels"] == 0:
+
+        return (
+            False,
+            "No YOLO labels found. Annotate your images first.",
+            stats
+        )
+
+    image_names = set()
+
+    for path in list_images(
+        TRAIN_IMAGES_DIR
+    ):
+
+        image_names.add(
+            os.path.splitext(
+                os.path.basename(path)
+            )[0]
+        )
+
+    label_names = set()
+
+    for path in list_labels(
+        TRAIN_LABELS_DIR
+    ):
+
+        label_names.add(
+            os.path.splitext(
+                os.path.basename(path)
+            )[0]
+        )
+
+    matched = image_names.intersection(
+        label_names
+    )
+
+    if not matched:
+
+        return (
+            False,
+            "No image has a matching YOLO label.",
+            stats
+        )
+
+    return (
+        True,
+        "Dataset is ready.",
+        stats
+    )
+
+
+# ============================================================
+# CREATE VALIDATION DATA
+# ============================================================
+
+def prepare_validation_data():
+
+    train_images = list_images(
+        TRAIN_IMAGES_DIR
+    )
+
+    if len(train_images) < 2:
+
+        return
+
+    # Clear old validation set
+    for path in list_images(
+        VAL_IMAGES_DIR
+    ):
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    for path in list_labels(
+        VAL_LABELS_DIR
+    ):
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    # Use approximately 20% for validation.
+    # At least one image if there are 2+ images.
+    val_count = max(
+        1,
+        int(len(train_images) * 0.2)
+    )
+
+    selected = train_images[
+        -val_count:
+    ]
+
+    for image_path in selected:
+
+        filename = os.path.basename(
+            image_path
+        )
+
+        label_name = (
+            os.path.splitext(filename)[0]
+            + ".txt"
+        )
+
+        label_path = os.path.join(
+            TRAIN_LABELS_DIR,
+            label_name
+        )
+
+        if not os.path.isfile(
+            label_path
+        ):
+            continue
+
+        shutil.copy2(
+            image_path,
+            os.path.join(
+                VAL_IMAGES_DIR,
+                filename
+            )
+        )
+
+        shutil.copy2(
+            label_path,
+            os.path.join(
+                VAL_LABELS_DIR,
+                label_name
+            )
+        )
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def set_training(**kwargs):
 
     with TRAINING_LOCK:
-        TRAINING_STATE.update(kwargs)
+
+        TRAINING_STATE.update(
+            kwargs
+        )
 
 
-def run_yolo_training(epochs=20):
+def run_training(epochs):
 
     try:
 
-        update_training_state(
+        set_training(
             status="preparing",
-            message="Preparing YOLO dataset...",
+            message="Preparing dataset...",
             progress=1,
-            epoch=0,
             total_epochs=epochs,
             error=None
         )
 
-        valid, message, stats = validate_dataset()
+        valid, message, stats = (
+            validate_dataset()
+        )
 
-        update_training_state(
+        set_training(
             images=stats["images"],
             labels=stats["labels"]
         )
 
         if not valid:
-            update_training_state(
+
+            set_training(
                 status="error",
                 message=message,
                 progress=0,
                 error=message,
                 finished_at=datetime.now().isoformat()
             )
+
             return
 
         if YOLO is None:
+
             message = (
-                "Ultralytics YOLO is not installed. "
+                "Ultralytics is not installed. "
                 "Add ultralytics to requirements.txt."
             )
 
-            update_training_state(
+            set_training(
                 status="error",
                 message=message,
-                progress=0,
-                error=message,
-                finished_at=datetime.now().isoformat()
+                error=message
             )
+
             return
 
-        make_dataset_yaml()
+        prepare_validation_data()
 
-        update_training_state(
+        create_dataset_yaml()
+
+        set_training(
             status="loading_model",
             message="Loading YOLO model...",
-            progress=2
+            progress=3
         )
 
         model_path = DEFAULT_MODEL
 
-        # If trained model already exists, use it.
-        if os.path.exists(TRAINED_MODEL):
+        if os.path.isfile(
+            TRAINED_MODEL
+        ):
+
             model_path = TRAINED_MODEL
 
-        print("Loading model:", model_path)
+        print(
+            "YOLO MODEL:",
+            model_path
+        )
 
-        model = YOLO(model_path)
+        model = YOLO(
+            model_path
+        )
 
-        update_training_state(
+        set_training(
             status="training",
-            message=f"Training YOLO for {epochs} epochs...",
+            message=(
+                "Training YOLO for "
+                + str(epochs)
+                + " epochs..."
+            ),
             progress=5
         )
 
-        # ----------------------------------------------------
-        # TRAIN
-        # ----------------------------------------------------
-
-        results = model.train(
-            data=YOLO_DATASET_YAML,
+        model.train(
+            data=YOLO_YAML,
             epochs=int(epochs),
             imgsz=640,
             batch=4,
@@ -677,27 +898,27 @@ def run_yolo_training(epochs=20):
             verbose=True
         )
 
-        # ----------------------------------------------------
-        # FIND BEST MODEL
-        # ----------------------------------------------------
-
-        possible_best = os.path.join(
+        best_model = os.path.join(
             MODELS_DIR,
             "bucket_training",
             "weights",
             "best.pt"
         )
 
-        if os.path.exists(possible_best):
+        if os.path.isfile(
+            best_model
+        ):
 
             shutil.copy2(
-                possible_best,
+                best_model,
                 TRAINED_MODEL
             )
 
-        update_training_state(
+        set_training(
             status="completed",
-            message="YOLO training completed successfully.",
+            message=(
+                "YOLO training completed successfully."
+            ),
             progress=100,
             epoch=epochs,
             total_epochs=epochs,
@@ -705,16 +926,17 @@ def run_yolo_training(epochs=20):
             error=None
         )
 
-        print("YOLO TRAINING COMPLETED.")
-
     except Exception as e:
 
-        error_text = traceback.format_exc()
+        error = traceback.format_exc()
 
-        print("YOLO TRAINING ERROR:")
-        print(error_text)
+        print(
+            "TRAINING ERROR:"
+        )
 
-        update_training_state(
+        print(error)
+
+        set_training(
             status="error",
             message=str(e),
             progress=0,
@@ -723,7 +945,7 @@ def run_yolo_training(epochs=20):
         )
 
 
-def start_training(epochs=20):
+def start_training(epochs):
 
     with TRAINING_LOCK:
 
@@ -733,116 +955,103 @@ def start_training(epochs=20):
             "training"
         ]:
 
-            return False, "Training is already running."
+            return (
+                False,
+                "Training is already running."
+            )
 
         TRAINING_STATE.update({
             "status": "preparing",
-            "message": "Training started.",
+            "message": "Preparing training...",
             "progress": 0,
             "epoch": 0,
-            "total_epochs": int(epochs),
-            "started_at": datetime.now().isoformat(),
+            "total_epochs": epochs,
+            "started_at":
+                datetime.now().isoformat(),
             "finished_at": None,
             "error": None
         })
 
     thread = threading.Thread(
-        target=run_yolo_training,
-        args=(int(epochs),),
+        target=run_training,
+        args=(epochs,),
         daemon=True
     )
 
     thread.start()
 
-    return True, "Training started."
+    return (
+        True,
+        "Training started."
+    )
 
 
 # ============================================================
-# HTTP HELPERS
+# REFERENCE IMAGES
 # ============================================================
 
-def json_response(handler, data, status=200):
+def save_reference(
+    filename,
+    data
+):
 
-    body = json.dumps(
-        data,
-        ensure_ascii=False,
-        default=str
-    ).encode("utf-8")
+    extension = os.path.splitext(
+        filename
+    )[1].lower()
 
-    handler.send_response(status)
+    if extension not in IMAGE_EXTENSIONS:
+        extension = ".jpg"
 
-    handler.send_header(
-        "Content-Type",
-        "application/json; charset=utf-8"
+    new_name = (
+        datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        + "_"
+        + uuid.uuid4().hex[:8]
+        + extension
     )
 
-    handler.send_header(
-        "Content-Length",
-        str(len(body))
+    path = os.path.join(
+        REFERENCE_DIR,
+        new_name
     )
 
-    handler.send_header(
-        "Cache-Control",
-        "no-cache"
-    )
+    with open(
+        path,
+        "wb"
+    ) as f:
 
-    handler.end_headers()
+        f.write(data)
 
-    handler.wfile.write(body)
-
-
-def html_response(handler, html, status=200):
-
-    body = html.encode("utf-8")
-
-    handler.send_response(status)
-
-    handler.send_header(
-        "Content-Type",
-        "text/html; charset=utf-8"
-    )
-
-    handler.send_header(
-        "Content-Length",
-        str(len(body))
-    )
-
-    handler.end_headers()
-
-    handler.wfile.write(body)
+    return new_name
 
 
-def text_response(handler, text, status=200):
+def reference_images():
 
-    body = text.encode("utf-8")
+    result = []
 
-    handler.send_response(status)
+    for filename in os.listdir(
+        REFERENCE_DIR
+    ):
 
-    handler.send_header(
-        "Content-Type",
-        "text/plain; charset=utf-8"
-    )
+        path = os.path.join(
+            REFERENCE_DIR,
+            filename
+        )
 
-    handler.send_header(
-        "Content-Length",
-        str(len(body))
-    )
+        if (
+            os.path.isfile(path)
+            and is_image(filename)
+        ):
 
-    handler.end_headers()
+            result.append({
+                "name": filename,
+                "url":
+                    "/reference/"
+                    + filename
+            })
 
-    handler.wfile.write(body)
-
-
-def not_found(handler):
-
-    json_response(
-        handler,
-        {
-            "ok": False,
-            "error": "Not found"
-        },
-        404
-    )
+    return result
 
 
 # ============================================================
@@ -861,20 +1070,18 @@ def parse_multipart(handler):
 
     boundary = None
 
-    parts = content_type.split(";")
-
-    for part in parts:
+    for part in content_type.split(";"):
 
         part = part.strip()
 
-        if part.startswith("boundary="):
+        if part.startswith(
+            "boundary="
+        ):
 
             boundary = part.split(
                 "=",
                 1
-            )[1]
-
-            boundary = boundary.strip('"')
+            )[1].strip('"')
 
     if not boundary:
         return {}
@@ -886,45 +1093,55 @@ def parse_multipart(handler):
         )
     )
 
-    raw = handler.rfile.read(length)
+    raw = handler.rfile.read(
+        length
+    )
 
     boundary_bytes = (
-        b"--" + boundary.encode()
+        b"--"
+        + boundary.encode()
     )
 
     result = {}
 
-    for block in raw.split(boundary_bytes):
+    for block in raw.split(
+        boundary_bytes
+    ):
 
         if not block:
             continue
 
-        if block in [b"--", b"--\r\n"]:
+        if block in [
+            b"--",
+            b"--\r\n"
+        ]:
             continue
 
-        block = block.strip(b"\r\n-")
+        block = block.strip(
+            b"\r\n-"
+        )
 
         header_end = block.find(
             b"\r\n\r\n"
         )
 
-        if header_end == -1:
+        if header_end < 0:
             continue
 
-        header_data = block[
+        headers = block[
             :header_end
         ].decode(
             "utf-8",
             errors="ignore"
         )
 
-        file_data = block[
+        data = block[
             header_end + 4:
         ]
 
         disposition = ""
 
-        for line in header_data.split(
+        for line in headers.split(
             "\r\n"
         ):
 
@@ -961,25 +1178,111 @@ def parse_multipart(handler):
 
             result[name] = {
                 "filename": filename,
-                "data": file_data
+                "data": data
             }
 
     return result
 
 
 # ============================================================
-# HTML PAGE
+# RESPONSE HELPERS
 # ============================================================
 
-HTML_PAGE = r"""
+def send_json(
+    handler,
+    data,
+    status=200
+):
+
+    body = json.dumps(
+        data,
+        ensure_ascii=False,
+        default=str
+    ).encode("utf-8")
+
+    handler.send_response(
+        status
+    )
+
+    handler.send_header(
+        "Content-Type",
+        "application/json; charset=utf-8"
+    )
+
+    handler.send_header(
+        "Content-Length",
+        str(len(body))
+    )
+
+    handler.send_header(
+        "Cache-Control",
+        "no-cache"
+    )
+
+    handler.end_headers()
+
+    handler.wfile.write(
+        body
+    )
+
+
+def send_html(
+    handler,
+    html,
+    status=200
+):
+
+    body = html.encode(
+        "utf-8"
+    )
+
+    handler.send_response(
+        status
+    )
+
+    handler.send_header(
+        "Content-Type",
+        "text/html; charset=utf-8"
+    )
+
+    handler.send_header(
+        "Content-Length",
+        str(len(body))
+    )
+
+    handler.end_headers()
+
+    handler.wfile.write(
+        body
+    )
+
+
+def send_not_found(handler):
+
+    send_json(
+        handler,
+        {
+            "ok": False,
+            "error": "Not found"
+        },
+        404
+    )
+
+
+# ============================================================
+# HTML
+# ============================================================
+
+HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
 
 <meta charset="UTF-8">
 
 <meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+content="width=device-width,initial-scale=1.0">
 
 <title>NEERIKA BUCKET AI</title>
 
@@ -993,7 +1296,7 @@ body {
     margin: 0;
     font-family: Arial, sans-serif;
     background: #f4f6f8;
-    color: #222;
+    color: #1e293b;
 }
 
 header {
@@ -1033,9 +1336,9 @@ nav button.active {
 }
 
 main {
-    padding: 18px;
     max-width: 1200px;
     margin: auto;
+    padding: 18px;
 }
 
 .section {
@@ -1048,23 +1351,23 @@ main {
 
 .card {
     background: white;
+    border-radius: 12px;
     padding: 18px;
     margin-bottom: 18px;
-    border-radius: 12px;
     box-shadow: 0 2px 8px rgba(0,0,0,.08);
 }
 
-.stat-grid {
+.stats {
     display: grid;
     grid-template-columns:
-        repeat(auto-fit, minmax(180px, 1fr));
+        repeat(auto-fit,minmax(180px,1fr));
     gap: 15px;
 }
 
 .stat {
     background: white;
-    border-radius: 12px;
     padding: 20px;
+    border-radius: 12px;
     box-shadow: 0 2px 8px rgba(0,0,0,.08);
 }
 
@@ -1075,52 +1378,71 @@ main {
 
 .stat strong {
     display: block;
-    font-size: 32px;
     margin-top: 8px;
-}
-
-button,
-input,
-select {
-    font-size: 16px;
+    font-size: 30px;
 }
 
 button.primary {
+    border: 0;
     background: #111827;
     color: white;
-    border: 0;
-    border-radius: 8px;
     padding: 12px 18px;
+    border-radius: 8px;
     cursor: pointer;
+    font-weight: bold;
 }
 
 button.primary:hover {
     opacity: .9;
 }
 
-input[type="file"] {
-    margin: 10px 0;
+button.danger {
+    border: 0;
+    background: #b91c1c;
+    color: white;
+    padding: 10px 15px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+input,
+select {
+    padding: 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
 }
 
 .status {
+    background: #f1f5f9;
     padding: 14px;
     border-radius: 8px;
-    background: #f1f5f9;
     margin-top: 12px;
+}
+
+.success {
+    color: #15803d;
+}
+
+.error {
+    color: #b91c1c;
+}
+
+.warning {
+    color: #a16207;
 }
 
 .progress {
     width: 100%;
     height: 20px;
-    background: #e5e7eb;
+    background: #e2e8f0;
     border-radius: 10px;
     overflow: hidden;
-    margin-top: 10px;
+    margin-top: 12px;
 }
 
-.progress-bar {
-    height: 100%;
+.progressBar {
     width: 0%;
+    height: 100%;
     background: #111827;
     transition: width .3s;
 }
@@ -1140,39 +1462,105 @@ td {
 .preview-grid {
     display: grid;
     grid-template-columns:
-        repeat(auto-fill, minmax(160px, 1fr));
+        repeat(auto-fill,minmax(170px,1fr));
     gap: 12px;
 }
 
 .preview {
     background: #f8fafc;
-    border-radius: 8px;
     padding: 8px;
+    border-radius: 8px;
 }
 
 .preview img {
     width: 100%;
-    height: 130px;
+    height: 140px;
     object-fit: cover;
     border-radius: 6px;
 }
 
-.success {
-    color: #166534;
+.image-item {
+    border: 2px solid transparent;
+    cursor: pointer;
 }
 
-.error {
-    color: #b91c1c;
+.image-item.selected {
+    border-color: #111827;
 }
 
-.warning {
-    color: #92400e;
+.annotation-layout {
+    display: grid;
+    grid-template-columns:
+        260px 1fr;
+    gap: 18px;
+}
+
+@media(max-width:800px) {
+
+    .annotation-layout {
+        grid-template-columns: 1fr;
+    }
+
+}
+
+.image-list {
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.annotation-image-wrapper {
+    position: relative;
+    width: 100%;
+    max-width: 900px;
+    margin: auto;
+    background: #111;
+    overflow: hidden;
+}
+
+#annotationImage {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+#annotationCanvas {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+}
+
+.annotation-help {
+    background: #f8fafc;
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+
+.box-list {
+    margin-top: 12px;
+}
+
+.box-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px;
+    background: #f1f5f9;
+    margin-bottom: 5px;
+    border-radius: 6px;
+}
+
+video {
+    width: 100%;
+    max-width: 700px;
 }
 
 footer {
     text-align: center;
-    color: #64748b;
     padding: 30px;
+    color: #64748b;
 }
 
 </style>
@@ -1191,28 +1579,33 @@ footer {
 
 <nav>
 
-<button onclick="showSection('dashboard', this)"
-        class="active">
+<button class="active"
+onclick="showSection('dashboard',this)">
 Dashboard
 </button>
 
-<button onclick="showSection('camera', this)">
+<button
+onclick="showSection('camera',this)">
 Camera
 </button>
 
-<button onclick="showSection('buckets', this)">
+<button
+onclick="showSection('buckets',this)">
 Buckets
 </button>
 
-<button onclick="showSection('training', this)">
+<button
+onclick="showSection('training',this)">
 Training
 </button>
 
-<button onclick="showSection('history', this)">
+<button
+onclick="showSection('history',this)">
 History
 </button>
 
-<button onclick="showSection('settings', this)">
+<button
+onclick="showSection('settings',this)">
 Settings
 </button>
 
@@ -1220,42 +1613,61 @@ Settings
 
 <main>
 
-<!-- ===================================================== -->
+
+<!-- ================================================= -->
 <!-- DASHBOARD -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
 
 <section id="dashboard"
-         class="section active">
+class="section active">
 
-<div class="stat-grid">
+<div class="stats">
 
 <div class="stat">
+
 <h3>Total Buckets</h3>
-<strong id="totalCount">0</strong>
+
+<strong id="totalCount">
+0
+</strong>
+
 </div>
 
 <div class="stat">
+
 <h3>Training Images</h3>
-<strong id="imageCount">0</strong>
+
+<strong id="dashboardImages">
+0
+</strong>
+
 </div>
 
 <div class="stat">
+
 <h3>YOLO Labels</h3>
-<strong id="labelCount">0</strong>
+
+<strong id="dashboardLabels">
+0
+</strong>
+
 </div>
 
 <div class="stat">
-<h3>Training Status</h3>
-<strong id="dashboardStatus">
+
+<h3>Training</h3>
+
+<strong id="dashboardTraining">
 Idle
 </strong>
+
 </div>
 
 </div>
 
 <div class="card">
 
-<h2>System Status</h2>
+<h2>System</h2>
 
 <p id="systemMessage">
 Loading...
@@ -1266,27 +1678,25 @@ Loading...
 </section>
 
 
-<!-- ===================================================== -->
+<!-- ================================================= -->
 <!-- CAMERA -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
 
 <section id="camera"
-         class="section">
+class="section">
 
 <div class="card">
 
 <h2>Camera</h2>
 
 <video id="cameraVideo"
-       autoplay
-       playsinline
-       style="width:100%;max-width:700px;">
-</video>
+autoplay
+playsinline></video>
 
 <br><br>
 
 <button class="primary"
-        onclick="startCamera()">
+onclick="startCamera()">
 Start Camera
 </button>
 
@@ -1295,44 +1705,44 @@ Start Camera
 </section>
 
 
-<!-- ===================================================== -->
-<!-- BUCKETS -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
+<!-- BUCKET REFERENCE -->
+<!-- ================================================= -->
 
 <section id="buckets"
-         class="section">
+class="section">
 
 <div class="card">
 
 <h2>Bucket Reference Images</h2>
 
 <p>
-Upload reference photos of the loaded bucket type.
+Store reference photos of the bucket type.
 </p>
 
-<input type="file"
-       id="referenceFile"
-       accept="image/*">
+<input
+type="file"
+id="referenceFile"
+accept="image/*">
 
-<br>
+<br><br>
 
-<button class="primary"
-        onclick="uploadReference()">
+<button
+class="primary"
+onclick="uploadReference()">
+
 Upload Reference Image
+
 </button>
 
-<div id="referenceMessage"
-     class="status">
-</div>
+<p id="referenceMessage"></p>
 
 </div>
 
 <div class="card">
 
-<h3>Reference Images</h3>
-
 <div id="referenceGrid"
-     class="preview-grid">
+class="preview-grid">
 </div>
 
 </div>
@@ -1340,34 +1750,38 @@ Upload Reference Image
 </section>
 
 
-<!-- ===================================================== -->
+<!-- ================================================= -->
 <!-- TRAINING -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
 
 <section id="training"
-         class="section">
+class="section">
 
 <div class="card">
 
 <h2>YOLO Training Dataset</h2>
 
 <p>
-Upload images for training.
+Step 1: Upload a clear photo of a loaded ore bucket.
 </p>
 
-<input type="file"
-       id="trainingFile"
-       accept="image/*">
+<input
+type="file"
+id="trainingFile"
+accept="image/*">
 
-<br>
+<br><br>
 
-<button class="primary"
-        onclick="uploadTrainingImage()">
+<button
+class="primary"
+onclick="uploadTrainingImage()">
+
 Upload Image
+
 </button>
 
 <div id="uploadMessage"
-     class="status">
+class="status">
 </div>
 
 </div>
@@ -1414,12 +1828,101 @@ Upload Image
 </div>
 
 
+<!-- ================================================= -->
+<!-- ANNOTATION -->
+<!-- ================================================= -->
+
+<div class="card">
+
+<h2>YOLO Annotation</h2>
+
+<div class="annotation-help">
+
+<strong>Step 2:</strong>
+
+Select an uploaded image, then drag your finger or mouse
+around the <strong>loaded ore bucket</strong>.
+
+Do not draw boxes around people, empty buckets,
+equipment or other objects.
+
+</div>
+
+<div class="annotation-layout">
+
+<div>
+
+<h3>Images</h3>
+
+<div
+id="imageList"
+class="image-list">
+</div>
+
+</div>
+
+
+<div>
+
+<div class="annotation-image-wrapper">
+
+<img
+id="annotationImage"
+alt="Select an image">
+
+<canvas
+id="annotationCanvas">
+</canvas>
+
+</div>
+
+<br>
+
+<button
+class="primary"
+onclick="saveAnnotation()">
+
+Save Annotation
+
+</button>
+
+<button
+class="danger"
+onclick="clearBoxes()">
+
+Clear Boxes
+
+</button>
+
+<div id="annotationMessage"
+class="status">
+
+Select an image.
+
+</div>
+
+<div class="box-list"
+id="boxList">
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+<!-- ================================================= -->
+<!-- TRAINING STATUS -->
+<!-- ================================================= -->
+
 <div class="card">
 
 <h2>Training Status</h2>
 
-<div id="trainingStatus"
-     class="status">
+<div
+id="trainingStatus"
+class="status">
 
 Status: idle
 
@@ -1427,8 +1930,9 @@ Status: idle
 
 <div class="progress">
 
-<div id="progressBar"
-     class="progress-bar">
+<div
+id="progressBar"
+class="progressBar">
 </div>
 
 </div>
@@ -1450,17 +1954,30 @@ Epochs:
 
 <select id="epochs">
 
-<option value="10">10</option>
-<option value="20" selected>20</option>
-<option value="30">30</option>
-<option value="50">50</option>
+<option value="10">
+10
+</option>
+
+<option value="20"
+selected>
+20
+</option>
+
+<option value="30">
+30
+</option>
+
+<option value="50">
+50
+</option>
 
 </select>
 
 <br><br>
 
-<button class="primary"
-        onclick="startTraining()">
+<button
+class="primary"
+onclick="startTraining()">
 
 Start YOLO Training
 
@@ -1471,19 +1988,20 @@ Start YOLO Training
 </section>
 
 
-<!-- ===================================================== -->
+<!-- ================================================= -->
 <!-- HISTORY -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
 
 <section id="history"
-         class="section">
+class="section">
 
 <div class="card">
 
 <h2>Bucket History</h2>
 
-<button class="primary"
-        onclick="loadHistory()">
+<button
+class="primary"
+onclick="loadHistory()">
 
 Refresh History
 
@@ -1491,13 +2009,14 @@ Refresh History
 
 <br><br>
 
-<div style="overflow-x:auto;">
+<div style="overflow-x:auto">
 
 <table>
 
 <thead>
 
 <tr>
+
 <th>ID</th>
 <th>Bucket Type</th>
 <th>Count</th>
@@ -1505,11 +2024,13 @@ Refresh History
 <th>Operator</th>
 <th>Confidence</th>
 <th>Date</th>
+
 </tr>
 
 </thead>
 
-<tbody id="historyBody">
+<tbody
+id="historyBody">
 </tbody>
 
 </table>
@@ -1521,12 +2042,12 @@ Refresh History
 </section>
 
 
-<!-- ===================================================== -->
+<!-- ================================================= -->
 <!-- SETTINGS -->
-<!-- ===================================================== -->
+<!-- ================================================= -->
 
 <section id="settings"
-         class="section">
+class="section">
 
 <div class="card">
 
@@ -1537,16 +2058,20 @@ Application: NEERIKA BUCKET AI
 </p>
 
 <p>
-Model: YOLO
-</p>
-
-<p>
-Detection class: BUCKET_LOADED
+Detection class:
+<strong>BUCKET_LOADED</strong>
 </p>
 
 <p>
 Database:
 <span id="databaseStatus">
+Checking...
+</span>
+</p>
+
+<p>
+YOLO:
+<span id="yoloStatus">
 Checking...
 </span>
 </p>
@@ -1558,27 +2083,35 @@ Checking...
 </main>
 
 <footer>
-
 Geology & Mining Services
-
 </footer>
 
 
 <script>
 
+let currentImage = null;
+
+let boxes = [];
+
+let drawing = false;
+
+let startX = 0;
+
+let startY = 0;
+
 let cameraStream = null;
 
 
-/* ========================================================
+/* =====================================================
    NAVIGATION
-======================================================== */
+===================================================== */
 
 function showSection(id, button) {
 
     document
         .querySelectorAll(".section")
         .forEach(
-            section => section.classList.remove("active")
+            x => x.classList.remove("active")
         );
 
     document
@@ -1588,7 +2121,7 @@ function showSection(id, button) {
     document
         .querySelectorAll("nav button")
         .forEach(
-            b => b.classList.remove("active")
+            x => x.classList.remove("active")
         );
 
     if (button) {
@@ -1596,8 +2129,11 @@ function showSection(id, button) {
     }
 
     if (id === "training") {
+
         loadDataset();
+        loadTrainingImages();
         loadTrainingStatus();
+
     }
 
     if (id === "history") {
@@ -1607,127 +2143,121 @@ function showSection(id, button) {
     if (id === "buckets") {
         loadReferences();
     }
+
 }
 
 
-/* ========================================================
+/* =====================================================
    DASHBOARD
-======================================================== */
+===================================================== */
 
 async function loadDashboard() {
 
     try {
 
-        const response =
+        const r =
             await fetch("/api/dashboard");
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
         document.getElementById(
             "totalCount"
-        ).textContent = data.total_count;
-
-        document.getElementById(
-            "imageCount"
-        ).textContent = data.dataset.images;
-
-        document.getElementById(
-            "labelCount"
-        ).textContent = data.dataset.labels;
-
-        document.getElementById(
-            "dashboardStatus"
         ).textContent =
-            data.training.status;
+            d.total_count;
+
+        document.getElementById(
+            "dashboardImages"
+        ).textContent =
+            d.dataset.images;
+
+        document.getElementById(
+            "dashboardLabels"
+        ).textContent =
+            d.dataset.labels;
+
+        document.getElementById(
+            "dashboardTraining"
+        ).textContent =
+            d.training.status;
 
         document.getElementById(
             "systemMessage"
         ).textContent =
-            data.message;
+            d.message;
 
-    } catch (error) {
+    } catch (e) {
 
         document.getElementById(
             "systemMessage"
         ).textContent =
-            "Could not connect to server.";
+            "Server connection error.";
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
    DATASET
-======================================================== */
+===================================================== */
 
 async function loadDataset() {
 
     try {
 
-        const response =
+        const r =
             await fetch("/api/dataset");
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
         document.getElementById(
             "trainImages"
         ).textContent =
-            data.train_images;
+            d.train_images;
 
         document.getElementById(
             "valImages"
         ).textContent =
-            data.val_images;
+            d.val_images;
 
         document.getElementById(
             "trainLabels"
         ).textContent =
-            data.train_labels;
+            d.train_labels;
 
         document.getElementById(
             "valLabels"
         ).textContent =
-            data.val_labels;
+            d.val_labels;
 
         document.getElementById(
             "allImages"
         ).textContent =
-            data.images;
+            d.images;
 
         document.getElementById(
             "allLabels"
         ).textContent =
-            data.labels;
+            d.labels;
 
-        document.getElementById(
-            "imageCount"
-        ).textContent =
-            data.images;
+    } catch (e) {
 
-        document.getElementById(
-            "labelCount"
-        ).textContent =
-            data.labels;
-
-    } catch (error) {
-
-        console.error(error);
+        console.error(e);
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
    UPLOAD TRAINING IMAGE
-======================================================== */
+===================================================== */
 
 async function uploadTrainingImage() {
 
-    const fileInput =
+    const input =
         document.getElementById(
             "trainingFile"
         );
@@ -1737,87 +2267,680 @@ async function uploadTrainingImage() {
             "uploadMessage"
         );
 
-    if (!fileInput.files.length) {
+    if (!input.files.length) {
 
         message.innerHTML =
-            '<span class="error">' +
-            'Please choose an image first.' +
-            '</span>';
+            "<span class='error'>" +
+            "Choose an image first." +
+            "</span>";
 
         return;
     }
 
-    const formData =
+    const form =
         new FormData();
 
-    formData.append(
+    form.append(
         "image",
-        fileInput.files[0]
+        input.files[0]
     );
 
     message.textContent =
-        "Uploading image...";
+        "Uploading...";
 
     try {
 
-        const response =
+        const r =
             await fetch(
                 "/api/training/upload",
                 {
                     method: "POST",
-                    body: formData
+                    body: form
                 }
             );
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
-        if (!data.ok) {
+        if (!d.ok) {
 
             message.innerHTML =
-                '<span class="error">' +
-                data.error +
-                '</span>';
+                "<span class='error'>" +
+                d.error +
+                "</span>";
 
             return;
         }
 
         message.innerHTML =
-            '<span class="success">' +
-            "Image uploaded successfully: " +
-            data.filename +
-            '</span>';
+            "<span class='success'>" +
+            "Image uploaded successfully." +
+            "</span>";
 
-        fileInput.value = "";
+        input.value = "";
 
-        loadDataset();
-        loadDashboard();
+        await loadDataset();
 
-    } catch (error) {
+        await loadTrainingImages();
+
+    } catch (e) {
 
         message.innerHTML =
-            '<span class="error">' +
-            error.message +
-            '</span>';
+            "<span class='error'>" +
+            e.message +
+            "</span>";
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
+   LOAD TRAINING IMAGES
+===================================================== */
+
+async function loadTrainingImages() {
+
+    const list =
+        document.getElementById(
+            "imageList"
+        );
+
+    try {
+
+        const r =
+            await fetch(
+                "/api/training/images"
+            );
+
+        const d =
+            await r.json();
+
+        list.innerHTML = "";
+
+        if (!d.images.length) {
+
+            list.innerHTML =
+                "<p>No training images yet.</p>";
+
+            return;
+        }
+
+        d.images.forEach(
+            image => {
+
+                const div =
+                    document.createElement(
+                        "div"
+                    );
+
+                div.className =
+                    "preview image-item";
+
+                if (image.annotated) {
+
+                    div.style.borderColor =
+                        "#15803d";
+
+                }
+
+                div.innerHTML =
+                    `
+                    <img
+                    src="${image.url}"
+                    alt="${image.filename}">
+
+                    <div>
+                    ${image.filename}
+                    </div>
+
+                    <small>
+                    ${
+                        image.annotated
+                        ? "✓ Annotated"
+                        : "Not annotated"
+                    }
+                    </small>
+                    `;
+
+                div.onclick =
+                    function() {
+
+                        selectImage(
+                            image.filename
+                        );
+
+                    };
+
+                list.appendChild(div);
+
+            }
+        );
+
+    } catch (e) {
+
+        list.innerHTML =
+            "<p>Could not load images.</p>";
+
+    }
+
+}
+
+
+/* =====================================================
+   SELECT IMAGE
+===================================================== */
+
+function selectImage(filename) {
+
+    currentImage =
+        filename;
+
+    boxes = [];
+
+    document.getElementById(
+        "boxList"
+    ).innerHTML = "";
+
+    const img =
+        document.getElementById(
+            "annotationImage"
+        );
+
+    img.onload =
+        function() {
+
+            resizeCanvas();
+
+        };
+
+    img.src =
+        "/training-image/"
+        + encodeURIComponent(filename);
+
+    document.getElementById(
+        "annotationMessage"
+    ).innerHTML =
+        "Selected: <strong>"
+        + filename
+        + "</strong><br>" +
+        "Draw a box around the loaded bucket.";
+
+}
+
+
+/* =====================================================
+   CANVAS
+===================================================== */
+
+const canvas =
+    document.getElementById(
+        "annotationCanvas"
+    );
+
+const ctx =
+    canvas.getContext("2d");
+
+const image =
+    document.getElementById(
+        "annotationImage"
+    );
+
+
+function resizeCanvas() {
+
+    const rect =
+        image.getBoundingClientRect();
+
+    canvas.width =
+        rect.width;
+
+    canvas.height =
+        rect.height;
+
+    redraw();
+
+}
+
+
+window.addEventListener(
+    "resize",
+    resizeCanvas
+);
+
+
+/* =====================================================
+   MOUSE / TOUCH COORDINATES
+===================================================== */
+
+function getPosition(event) {
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    let clientX;
+    let clientY;
+
+    if (
+        event.touches &&
+        event.touches.length
+    ) {
+
+        clientX =
+            event.touches[0].clientX;
+
+        clientY =
+            event.touches[0].clientY;
+
+    } else {
+
+        clientX =
+            event.clientX;
+
+        clientY =
+            event.clientY;
+
+    }
+
+    return {
+        x: clientX - rect.left,
+        y: clientY - rect.top
+    };
+
+}
+
+
+/* =====================================================
+   START DRAWING
+===================================================== */
+
+function beginDrawing(event) {
+
+    if (!currentImage) {
+        return;
+    }
+
+    event.preventDefault();
+
+    const p =
+        getPosition(event);
+
+    startX = p.x;
+    startY = p.y;
+
+    drawing = true;
+
+}
+
+
+function moveDrawing(event) {
+
+    if (!drawing) {
+        return;
+    }
+
+    event.preventDefault();
+
+    const p =
+        getPosition(event);
+
+    redraw();
+
+    ctx.strokeStyle =
+        "#ff0000";
+
+    ctx.lineWidth = 3;
+
+    ctx.strokeRect(
+        startX,
+        startY,
+        p.x - startX,
+        p.y - startY
+    );
+
+}
+
+
+function finishDrawing(event) {
+
+    if (!drawing) {
+        return;
+    }
+
+    event.preventDefault();
+
+    const p =
+        getPosition(event);
+
+    drawing = false;
+
+    let x =
+        Math.min(
+            startX,
+            p.x
+        );
+
+    let y =
+        Math.min(
+            startY,
+            p.y
+        );
+
+    let width =
+        Math.abs(
+            p.x - startX
+        );
+
+    let height =
+        Math.abs(
+            p.y - startY
+        );
+
+    if (
+        width < 10 ||
+        height < 10
+    ) {
+
+        redraw();
+
+        return;
+    }
+
+    boxes.push({
+        x: x / canvas.width,
+        y: y / canvas.height,
+        width:
+            width / canvas.width,
+        height:
+            height / canvas.height
+    });
+
+    redraw();
+
+    updateBoxList();
+
+}
+
+
+/* =====================================================
+   CANVAS EVENTS
+===================================================== */
+
+canvas.addEventListener(
+    "mousedown",
+    beginDrawing
+);
+
+canvas.addEventListener(
+    "mousemove",
+    moveDrawing
+);
+
+canvas.addEventListener(
+    "mouseup",
+    finishDrawing
+);
+
+canvas.addEventListener(
+    "mouseleave",
+    finishDrawing
+);
+
+canvas.addEventListener(
+    "touchstart",
+    beginDrawing,
+    {passive:false}
+);
+
+canvas.addEventListener(
+    "touchmove",
+    moveDrawing,
+    {passive:false}
+);
+
+canvas.addEventListener(
+    "touchend",
+    finishDrawing,
+    {passive:false}
+);
+
+
+/* =====================================================
+   REDRAW
+===================================================== */
+
+function redraw() {
+
+    ctx.clearRect(
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+    boxes.forEach(
+        (box, index) => {
+
+            const x =
+                box.x * canvas.width;
+
+            const y =
+                box.y * canvas.height;
+
+            const w =
+                box.width * canvas.width;
+
+            const h =
+                box.height * canvas.height;
+
+            ctx.strokeStyle =
+                "#00ff00";
+
+            ctx.lineWidth = 3;
+
+            ctx.strokeRect(
+                x,
+                y,
+                w,
+                h
+            );
+
+            ctx.fillStyle =
+                "#00ff00";
+
+            ctx.font =
+                "bold 16px Arial";
+
+            ctx.fillText(
+                "BUCKET_LOADED "
+                + (index + 1),
+                x,
+                Math.max(
+                    18,
+                    y - 5
+                )
+            );
+
+        }
+    );
+
+}
+
+
+/* =====================================================
+   BOX LIST
+===================================================== */
+
+function updateBoxList() {
+
+    const list =
+        document.getElementById(
+            "boxList"
+        );
+
+    list.innerHTML = "";
+
+    boxes.forEach(
+        (box, index) => {
+
+            const div =
+                document.createElement(
+                    "div"
+                );
+
+            div.className =
+                "box-item";
+
+            div.innerHTML =
+                `
+                <span>
+                BUCKET_LOADED ${index + 1}
+                </span>
+
+                <button
+                onclick="deleteBox(${index})">
+                Delete
+                </button>
+                `;
+
+            list.appendChild(div);
+
+        }
+    );
+
+}
+
+
+function deleteBox(index) {
+
+    boxes.splice(
+        index,
+        1
+    );
+
+    redraw();
+
+    updateBoxList();
+
+}
+
+
+function clearBoxes() {
+
+    boxes = [];
+
+    redraw();
+
+    updateBoxList();
+
+}
+
+
+/* =====================================================
+   SAVE ANNOTATION
+===================================================== */
+
+async function saveAnnotation() {
+
+    const message =
+        document.getElementById(
+            "annotationMessage"
+        );
+
+    if (!currentImage) {
+
+        message.innerHTML =
+            "<span class='error'>" +
+            "Select an image first." +
+            "</span>";
+
+        return;
+    }
+
+    if (!boxes.length) {
+
+        message.innerHTML =
+            "<span class='error'>" +
+            "Draw at least one box around the bucket." +
+            "</span>";
+
+        return;
+    }
+
+    message.textContent =
+        "Saving annotation...";
+
+    try {
+
+        const r =
+            await fetch(
+                "/api/annotation/save",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        filename:
+                            currentImage,
+                        boxes:
+                            boxes
+                    })
+                }
+            );
+
+        const d =
+            await r.json();
+
+        if (!d.ok) {
+
+            message.innerHTML =
+                "<span class='error'>" +
+                d.error +
+                "</span>";
+
+            return;
+        }
+
+        message.innerHTML =
+            "<span class='success'>" +
+            "Annotation saved successfully." +
+            "<br>Label file: "
+            + d.label +
+            "</span>";
+
+        await loadDataset();
+
+        await loadTrainingImages();
+
+    } catch (e) {
+
+        message.innerHTML =
+            "<span class='error'>" +
+            e.message +
+            "</span>";
+
+    }
+
+}
+
+
+/* =====================================================
    TRAINING STATUS
-======================================================== */
+===================================================== */
 
 async function loadTrainingStatus() {
 
     try {
 
-        const response =
-            await fetch("/api/training/status");
+        const r =
+            await fetch(
+                "/api/training/status"
+            );
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
         const status =
             document.getElementById(
@@ -1825,23 +2948,25 @@ async function loadTrainingStatus() {
             );
 
         status.innerHTML =
-            "<strong>Status:</strong> " +
-            data.status +
-            "<br><br>" +
-            "<strong>Message:</strong> " +
-            data.message;
+            "<strong>Status:</strong> "
+            + d.status
+            + "<br><br>"
+            + "<strong>Message:</strong> "
+            + d.message;
 
-        if (data.error) {
+        if (d.error) {
 
             status.innerHTML +=
-                "<br><br><span class='error'>" +
-                data.error +
-                "</span>";
+                "<br><br><span class='error'>"
+                + d.error
+                + "</span>";
 
         }
 
         const progress =
-            Number(data.progress || 0);
+            Number(
+                d.progress || 0
+            );
 
         document.getElementById(
             "progressBar"
@@ -1853,30 +2978,27 @@ async function loadTrainingStatus() {
         ).textContent =
             progress + "%";
 
-        document.getElementById(
-            "dashboardStatus"
-        ).textContent =
-            data.status;
+    } catch (e) {
 
-    } catch (error) {
-
-        console.error(error);
+        console.error(e);
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
    START TRAINING
-======================================================== */
+===================================================== */
 
 async function startTraining() {
 
     const epochs =
-        document.getElementById(
-            "epochs"
-        ).value;
+        Number(
+            document.getElementById(
+                "epochs"
+            ).value
+        );
 
     const status =
         document.getElementById(
@@ -1899,19 +3021,19 @@ async function startTraining() {
         if (!checkData.ok) {
 
             status.innerHTML =
-                "<span class='error'>" +
-                checkData.message +
-                "</span>";
+                "<span class='error'>"
+                + checkData.message
+                + "</span>";
 
-            loadDataset();
+            await loadDataset();
 
             return;
         }
 
         status.textContent =
-            "Starting YOLO training...";
+            "Starting training...";
 
-        const response =
+        const r =
             await fetch(
                 "/api/training/start",
                 {
@@ -1921,39 +3043,48 @@ async function startTraining() {
                             "application/json"
                     },
                     body: JSON.stringify({
-                        epochs:
-                            Number(epochs)
+                        epochs: epochs
                     })
                 }
             );
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
+
+        if (!d.ok) {
+
+            status.innerHTML =
+                "<span class='error'>"
+                + d.message
+                + "</span>";
+
+            return;
+        }
 
         status.textContent =
-            data.message;
+            d.message;
 
         loadTrainingStatus();
 
-    } catch (error) {
+    } catch (e) {
 
         status.innerHTML =
-            "<span class='error'>" +
-            error.message +
-            "</span>";
+            "<span class='error'>"
+            + e.message
+            + "</span>";
 
     }
 
 }
 
 
-/* ========================================================
-   REFERENCE IMAGES
-======================================================== */
+/* =====================================================
+   REFERENCE UPLOAD
+===================================================== */
 
 async function uploadReference() {
 
-    const fileInput =
+    const input =
         document.getElementById(
             "referenceFile"
         );
@@ -1963,20 +3094,20 @@ async function uploadReference() {
             "referenceMessage"
         );
 
-    if (!fileInput.files.length) {
+    if (!input.files.length) {
 
         message.textContent =
-            "Choose an image first.";
+            "Choose an image.";
 
         return;
     }
 
-    const formData =
+    const form =
         new FormData();
 
-    formData.append(
+    form.append(
         "image",
-        fileInput.files[0]
+        input.files[0]
     );
 
     message.textContent =
@@ -1984,37 +3115,39 @@ async function uploadReference() {
 
     try {
 
-        const response =
+        const r =
             await fetch(
                 "/api/reference/upload",
                 {
                     method: "POST",
-                    body: formData
+                    body: form
                 }
             );
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
-        if (!data.ok) {
+        if (!d.ok) {
 
             message.textContent =
-                data.error;
+                d.error;
 
             return;
         }
 
-        message.textContent =
-            "Reference image uploaded.";
+        message.innerHTML =
+            "<span class='success'>" +
+            "Reference uploaded successfully."
+            + "</span>";
 
-        fileInput.value = "";
+        input.value = "";
 
         loadReferences();
 
-    } catch (error) {
+    } catch (e) {
 
         message.textContent =
-            error.message;
+            e.message;
 
     }
 
@@ -2023,24 +3156,24 @@ async function uploadReference() {
 
 async function loadReferences() {
 
+    const grid =
+        document.getElementById(
+            "referenceGrid"
+        );
+
     try {
 
-        const response =
+        const r =
             await fetch(
                 "/api/reference/list"
             );
 
-        const data =
-            await response.json();
-
-        const grid =
-            document.getElementById(
-                "referenceGrid"
-            );
+        const d =
+            await r.json();
 
         grid.innerHTML = "";
 
-        data.images.forEach(
+        d.images.forEach(
             image => {
 
                 const div =
@@ -2054,38 +3187,40 @@ async function loadReferences() {
                 div.innerHTML =
                     `
                     <img src="${image.url}">
-                    <div>${image.name}</div>
+                    <p>${image.name}</p>
                     `;
 
-                grid.appendChild(div);
+                grid.appendChild(
+                    div
+                );
 
             }
         );
 
-    } catch (error) {
+    } catch (e) {
 
-        console.error(error);
+        console.error(e);
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
    HISTORY
-======================================================== */
+===================================================== */
 
 async function loadHistory() {
 
     try {
 
-        const response =
+        const r =
             await fetch(
                 "/api/history"
             );
 
-        const data =
-            await response.json();
+        const d =
+            await r.json();
 
         const body =
             document.getElementById(
@@ -2094,7 +3229,7 @@ async function loadHistory() {
 
         body.innerHTML = "";
 
-        data.history.forEach(
+        d.history.forEach(
             item => {
 
                 const row =
@@ -2109,27 +3244,33 @@ async function loadHistory() {
                     <td>${item.count || 0}</td>
                     <td>${item.shift || ""}</td>
                     <td>${item.operator_name || ""}</td>
-                    <td>${Number(item.confidence || 0).toFixed(3)}</td>
+                    <td>
+                    ${Number(
+                        item.confidence || 0
+                    ).toFixed(3)}
+                    </td>
                     <td>${item.created_at || ""}</td>
                     `;
 
-                body.appendChild(row);
+                body.appendChild(
+                    row
+                );
 
             }
         );
 
-    } catch (error) {
+    } catch (e) {
 
-        console.error(error);
+        console.error(e);
 
     }
 
 }
 
 
-/* ========================================================
+/* =====================================================
    CAMERA
-======================================================== */
+===================================================== */
 
 async function startCamera() {
 
@@ -2140,7 +3281,8 @@ async function startCamera() {
             cameraStream
                 .getTracks()
                 .forEach(
-                    track => track.stop()
+                    track =>
+                        track.stop()
                 );
 
         }
@@ -2160,11 +3302,11 @@ async function startCamera() {
         ).srcObject =
             cameraStream;
 
-    } catch (error) {
+    } catch (e) {
 
         alert(
-            "Camera error: " +
-            error.message
+            "Camera error: "
+            + e.message
         );
 
     }
@@ -2172,9 +3314,9 @@ async function startCamera() {
 }
 
 
-/* ========================================================
+/* =====================================================
    AUTO REFRESH
-======================================================== */
+===================================================== */
 
 setInterval(
     loadTrainingStatus,
@@ -2187,12 +3329,14 @@ setInterval(
 );
 
 
-/* ========================================================
-   INITIAL LOAD
-======================================================== */
+/* =====================================================
+   INITIAL
+===================================================== */
 
 loadDashboard();
+
 loadDataset();
+
 loadTrainingStatus();
 
 </script>
@@ -2206,11 +3350,20 @@ loadTrainingStatus();
 # HTTP HANDLER
 # ============================================================
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(
+    BaseHTTPRequestHandler
+):
 
-    server_version = "NEERIKA-BUCKET-AI/1.0"
+    server_version = (
+        "NEERIKA-BUCKET-AI/2.0"
+    )
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+
         print(
             "%s - %s"
             % (
@@ -2219,9 +3372,10 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # GET
-    # --------------------------------------------------------
+    # ========================================================
 
     def do_GET(self):
 
@@ -2231,22 +3385,38 @@ class Handler(BaseHTTPRequestHandler):
 
         path = parsed.path
 
-        # Main page
+
+        # ----------------------------------------------------
+        # HOME
+        # ----------------------------------------------------
+
         if path == "/":
 
-            html_response(
+            send_html(
                 self,
-                HTML_PAGE
+                HTML
             )
 
             return
 
-        # Dashboard
+
+        # ----------------------------------------------------
+        # DASHBOARD
+        # ----------------------------------------------------
+
         if path == "/api/dashboard":
 
-            stats = dataset_statistics()
+            stats = (
+                dataset_statistics()
+            )
 
-            json_response(
+            with TRAINING_LOCK:
+
+                training = dict(
+                    TRAINING_STATE
+                )
+
+            send_json(
                 self,
                 {
                     "ok": True,
@@ -2255,7 +3425,7 @@ class Handler(BaseHTTPRequestHandler):
                     "dataset":
                         stats,
                     "training":
-                        dict(TRAINING_STATE),
+                        training,
                     "message":
                         "NEERIKA BUCKET AI is running."
                 }
@@ -2263,39 +3433,70 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # Dataset
+
+        # ----------------------------------------------------
+        # DATASET
+        # ----------------------------------------------------
+
         if path == "/api/dataset":
 
-            json_response(
+            send_json(
                 self,
                 dataset_statistics()
             )
 
             return
 
-        # Training status
+
+        # ----------------------------------------------------
+        # TRAINING IMAGES
+        # ----------------------------------------------------
+
+        if path == "/api/training/images":
+
+            send_json(
+                self,
+                {
+                    "ok": True,
+                    "images":
+                        get_training_images()
+                }
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # TRAINING STATUS
+        # ----------------------------------------------------
+
         if path == "/api/training/status":
 
             with TRAINING_LOCK:
+
                 state = dict(
                     TRAINING_STATE
                 )
 
-            json_response(
+            send_json(
                 self,
                 state
             )
 
             return
 
-        # Training check
+
+        # ----------------------------------------------------
+        # TRAINING CHECK
+        # ----------------------------------------------------
+
         if path == "/api/training/check":
 
             valid, message, stats = (
                 validate_dataset()
             )
 
-            json_response(
+            send_json(
                 self,
                 {
                     "ok": valid,
@@ -2306,54 +3507,61 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # History
+
+        # ----------------------------------------------------
+        # HISTORY
+        # ----------------------------------------------------
+
         if path == "/api/history":
 
-            json_response(
+            send_json(
                 self,
                 {
                     "ok": True,
                     "history":
-                        get_bucket_history()
+                        get_history()
                 }
             )
 
             return
 
-        # Reference list
+
+        # ----------------------------------------------------
+        # REFERENCE LIST
+        # ----------------------------------------------------
+
         if path == "/api/reference/list":
 
-            json_response(
+            send_json(
                 self,
                 {
                     "ok": True,
                     "images":
-                        list_reference_images()
+                        reference_images()
                 }
             )
 
             return
 
-        # Reference image
+
+        # ----------------------------------------------------
+        # TRAINING IMAGE FILE
+        # ----------------------------------------------------
+
         if path.startswith(
-            "/reference/"
+            "/training-image/"
         ):
 
             filename = os.path.basename(
-                path[len("/reference/"):]
+                path[
+                    len("/training-image/"):
+                ]
             )
 
             file_path = os.path.join(
-                REFERENCE_DIR,
+                TRAIN_IMAGES_DIR,
                 filename
             )
-
-            if not os.path.isfile(
-                file_path
-            ):
-
-                not_found(self)
-                return
 
             self.serve_file(
                 file_path
@@ -2361,31 +3569,63 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # Model download/test
+
+        # ----------------------------------------------------
+        # REFERENCE FILE
+        # ----------------------------------------------------
+
+        if path.startswith(
+            "/reference/"
+        ):
+
+            filename = os.path.basename(
+                path[
+                    len("/reference/"):
+                ]
+            )
+
+            file_path = os.path.join(
+                REFERENCE_DIR,
+                filename
+            )
+
+            self.serve_file(
+                file_path
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # MODEL STATUS
+        # ----------------------------------------------------
+
         if path == "/api/model/status":
 
-            json_response(
+            send_json(
                 self,
                 {
                     "ok": True,
-                    "ultralytics_installed":
+                    "ultralytics":
                         YOLO is not None,
-                    "trained_model_exists":
-                        os.path.exists(
-                            TRAINED_MODEL
-                        ),
                     "trained_model":
-                        TRAINED_MODEL
+                        os.path.isfile(
+                            TRAINED_MODEL
+                        )
                 }
             )
 
             return
 
-        not_found(self)
 
-    # --------------------------------------------------------
+        send_not_found(
+            self
+        )
+
+
+    # ========================================================
     # POST
-    # --------------------------------------------------------
+    # ========================================================
 
     def do_POST(self):
 
@@ -2395,6 +3635,7 @@ class Handler(BaseHTTPRequestHandler):
 
         path = parsed.path
 
+
         # ----------------------------------------------------
         # TRAINING IMAGE UPLOAD
         # ----------------------------------------------------
@@ -2403,16 +3644,17 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                fields = parse_multipart(
-                    self
-                )
+                fields =parse_multipart(
+                        self
+                    )
 
-                image = fields.get(
-                    "image"
-                )
+                image =  fields.get(
+                        "image"
+                    )
 
                 if not image:
-                    json_response(
+
+                    send_json(
                         self,
                         {
                             "ok": False,
@@ -2421,10 +3663,13 @@ class Handler(BaseHTTPRequestHandler):
                         },
                         400
                     )
+
                     return
 
                 filename = (
-                    image.get("filename")
+                    image.get(
+                        "filename"
+                    )
                     or "image.jpg"
                 )
 
@@ -2433,9 +3678,11 @@ class Handler(BaseHTTPRequestHandler):
                     b""
                 )
 
-                if not is_image(filename):
+                if not is_image(
+                    filename
+                ):
 
-                    json_response(
+                    send_json(
                         self,
                         {
                             "ok": False,
@@ -2444,41 +3691,39 @@ class Handler(BaseHTTPRequestHandler):
                         },
                         400
                     )
+
                     return
 
                 if not data:
 
-                    json_response(
+                    send_json(
                         self,
                         {
                             "ok": False,
                             "error":
-                                "Uploaded image is empty."
+                                "Image is empty."
                         },
                         400
                     )
+
                     return
 
-                saved_name, saved_path = (
+                saved = (
                     save_training_image(
                         filename,
                         data
                     )
                 )
 
-                # Automatically ensure dataset.yaml exists.
-                make_dataset_yaml()
+                create_dataset_yaml()
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": True,
-                        "filename":
-                            saved_name,
-                        "path":
-                            saved_path,
+                        "filename": saved,
                         "message":
-                            "Training image uploaded successfully.",
+                            "Image uploaded successfully.",
                         "dataset":
                             dataset_statistics()
                     }
@@ -2492,7 +3737,7 @@ class Handler(BaseHTTPRequestHandler):
                     traceback.format_exc()
                 )
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": False,
@@ -2503,73 +3748,83 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
         # ----------------------------------------------------
-        # REFERENCE IMAGE UPLOAD
+        # SAVE ANNOTATION
         # ----------------------------------------------------
 
-        if path == "/api/reference/upload":
+        if path == "/api/annotation/save":
 
             try:
 
-                fields = parse_multipart(
-                    self
+                length = int(
+                    self.headers.get(
+                        "Content-Length",
+                        "0"
+                    )
                 )
 
-                image = fields.get(
-                    "image"
+                raw = self.rfile.read(
+                    length
                 )
 
-                if not image:
+                payload = json.loads(
+                    raw.decode(
+                        "utf-8"
+                    )
+                )
 
-                    json_response(
+                filename = payload.get(
+                    "filename"
+                )
+
+                boxes = payload.get(
+                    "boxes",
+                    []
+                )
+
+                if not filename:
+
+                    send_json(
                         self,
                         {
                             "ok": False,
                             "error":
-                                "No image uploaded."
+                                "Filename is required."
                         },
                         400
                     )
 
                     return
 
-                filename = (
-                    image.get("filename")
-                    or "reference.jpg"
-                )
+                if not boxes:
 
-                data = image.get(
-                    "data",
-                    b""
-                )
-
-                if not is_image(filename):
-
-                    json_response(
+                    send_json(
                         self,
                         {
                             "ok": False,
                             "error":
-                                "Only image files are allowed."
+                                "At least one box is required."
                         },
                         400
                     )
 
                     return
 
-                saved_name = (
-                    save_reference_image(
-                        filename,
-                        data
-                    )
+                label = save_annotation(
+                    filename,
+                    boxes
                 )
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": True,
-                        "filename":
-                            saved_name
+                        "label": label,
+                        "message":
+                            "Annotation saved successfully.",
+                        "dataset":
+                            dataset_statistics()
                     }
                 )
 
@@ -2577,7 +3832,11 @@ class Handler(BaseHTTPRequestHandler):
 
             except Exception as e:
 
-                json_response(
+                print(
+                    traceback.format_exc()
+                )
+
+                send_json(
                     self,
                     {
                         "ok": False,
@@ -2587,6 +3846,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 return
+
 
         # ----------------------------------------------------
         # START TRAINING
@@ -2596,7 +3856,7 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                content_length = int(
+                length = int(
                     self.headers.get(
                         "Content-Length",
                         "0"
@@ -2604,7 +3864,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 raw = self.rfile.read(
-                    content_length
+                    length
                 )
 
                 payload = {}
@@ -2612,12 +3872,15 @@ class Handler(BaseHTTPRequestHandler):
                 if raw:
 
                     try:
+
                         payload = json.loads(
                             raw.decode(
                                 "utf-8"
                             )
                         )
+
                     except Exception:
+
                         payload = {}
 
                 epochs = int(
@@ -2627,28 +3890,28 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
 
-                if epochs < 1:
-                    epochs = 1
+                epochs = max(
+                    1,
+                    min(
+                        100,
+                        epochs
+                    )
+                )
 
-                if epochs > 100:
-                    epochs = 100
-
-                # IMPORTANT:
-                # Validate before saying training started.
                 valid, message, stats = (
                     validate_dataset()
                 )
 
                 if not valid:
 
-                    update_training_state(
+                    set_training(
                         status="error",
                         message=message,
                         progress=0,
                         error=message
                     )
 
-                    json_response(
+                    send_json(
                         self,
                         {
                             "ok": False,
@@ -2668,7 +3931,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 if not started:
 
-                    json_response(
+                    send_json(
                         self,
                         {
                             "ok": False,
@@ -2680,7 +3943,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     return
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": True,
@@ -2699,7 +3962,7 @@ class Handler(BaseHTTPRequestHandler):
                     traceback.format_exc()
                 )
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": False,
@@ -2711,6 +3974,94 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
+
+        # ----------------------------------------------------
+        # REFERENCE UPLOAD
+        # ----------------------------------------------------
+
+        if path == "/api/reference/upload":
+
+            try:
+
+                fields =parse_multipart(
+                        self
+                    )
+
+                image = fields.get(
+                        "image"
+                    )
+
+                if not image:
+
+                    send_json(
+                        self,
+                        {
+                            "ok": False,
+                            "error":
+                                "No image uploaded."
+                        },
+                        400
+                    )
+
+                    return
+
+                filename = (
+                    image.get(
+                        "filename"
+                    )
+                    or "reference.jpg"
+                )
+
+                data = image.get(
+                    "data",
+                    b""
+                )
+
+                if not is_image(
+                    filename
+                ):
+
+                    send_json(
+                        self,
+                        {
+                            "ok": False,
+                            "error":
+                                "Only images are allowed."
+                        },
+                        400
+                    )
+
+                    return
+
+                saved = save_reference(
+                    filename,
+                    data
+                )
+
+                send_json(
+                    self,
+                    {
+                        "ok": True,
+                        "filename": saved
+                    }
+                )
+
+                return
+
+            except Exception as e:
+
+                send_json(
+                    self,
+                    {
+                        "ok": False,
+                        "error": str(e)
+                    },
+                    500
+                )
+
+                return
+
+
         # ----------------------------------------------------
         # SAVE BUCKET COUNT
         # ----------------------------------------------------
@@ -2719,7 +4070,7 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                content_length = int(
+                length = int(
                     self.headers.get(
                         "Content-Length",
                         "0"
@@ -2727,60 +4078,51 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 raw = self.rfile.read(
-                    content_length
+                    length
                 )
 
                 payload = json.loads(
-                    raw.decode("utf-8")
-                )
-
-                bucket_type = payload.get(
-                    "bucket_type",
-                    "default"
-                )
-
-                count = int(
-                    payload.get(
-                        "count",
-                        1
-                    )
-                )
-
-                shift = payload.get(
-                    "shift",
-                    ""
-                )
-
-                operator_name = payload.get(
-                    "operator_name",
-                    ""
-                )
-
-                source = payload.get(
-                    "source",
-                    "camera"
-                )
-
-                confidence = float(
-                    payload.get(
-                        "confidence",
-                        0
+                    raw.decode(
+                        "utf-8"
                     )
                 )
 
                 success = save_bucket_count(
                     bucket_type=
-                        bucket_type,
-                    count=count,
-                    shift=shift,
+                        payload.get(
+                            "bucket_type",
+                            "default"
+                        ),
+                    count=int(
+                        payload.get(
+                            "count",
+                            1
+                        )
+                    ),
+                    shift=
+                        payload.get(
+                            "shift",
+                            ""
+                        ),
                     operator_name=
-                        operator_name,
-                    source=source,
-                    confidence=
-                        confidence
+                        payload.get(
+                            "operator_name",
+                            ""
+                        ),
+                    source=
+                        payload.get(
+                            "source",
+                            "camera"
+                        ),
+                    confidence=float(
+                        payload.get(
+                            "confidence",
+                            0
+                        )
+                    )
                 )
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": success,
@@ -2798,7 +4140,7 @@ class Handler(BaseHTTPRequestHandler):
 
             except Exception as e:
 
-                json_response(
+                send_json(
                     self,
                     {
                         "ok": False,
@@ -2809,13 +4151,30 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
-        not_found(self)
 
-    # --------------------------------------------------------
+        send_not_found(
+            self
+        )
+
+
+    # ========================================================
     # SERVE FILE
-    # --------------------------------------------------------
+    # ========================================================
 
-    def serve_file(self, file_path):
+    def serve_file(
+        self,
+        file_path
+    ):
+
+        if not os.path.isfile(
+            file_path
+        ):
+
+            send_not_found(
+                self
+            )
+
+            return
 
         extension = os.path.splitext(
             file_path
@@ -2831,14 +4190,14 @@ class Handler(BaseHTTPRequestHandler):
             ".webp":
                 "image/webp",
             ".bmp":
-                "image/bmp",
-            ".pt":
-                "application/octet-stream"
+                "image/bmp"
         }
 
-        content_type = content_types.get(
-            extension,
-            "application/octet-stream"
+        content_type = (
+            content_types.get(
+                extension,
+                "application/octet-stream"
+            )
         )
 
         try:
@@ -2850,7 +4209,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 data = f.read()
 
-            self.send_response(200)
+            self.send_response(
+                200
+            )
 
             self.send_header(
                 "Content-Type",
@@ -2864,29 +4225,49 @@ class Handler(BaseHTTPRequestHandler):
 
             self.end_headers()
 
-            self.wfile.write(data)
+            self.wfile.write(
+                data
+            )
 
-        except Exception:
+        except Exception as e:
 
-            not_found(self)
+            print(
+                "FILE ERROR:",
+                e
+            )
+
+            send_not_found(
+                self
+            )
 
 
 # ============================================================
-# START SERVER
+# MAIN
 # ============================================================
 
 def main():
 
     print("=" * 60)
-    print("NEERIKA BUCKET AI")
-    print("Mining Production Bucket Counter")
+
+    print(
+        "NEERIKA BUCKET AI"
+    )
+
+    print(
+        "Mining Production Bucket Counter"
+    )
+
     print("=" * 60)
 
-    print("BASE_DIR:", BASE_DIR)
+    print(
+        "BASE_DIR:",
+        BASE_DIR
+    )
 
-    print("AI_DIR:", AI_DIR)
-
-    print("DATASET_DIR:", DATASET_DIR)
+    print(
+        "DATASET_DIR:",
+        DATASET_DIR
+    )
 
     print(
         "TRAIN_IMAGES_DIR:",
@@ -2899,28 +4280,17 @@ def main():
     )
 
     print(
-        "VAL_IMAGES_DIR:",
-        VAL_IMAGES_DIR
-    )
-
-    print(
-        "VAL_LABELS_DIR:",
-        VAL_LABELS_DIR
-    )
-
-    print(
-        "YOLO available:",
+        "YOLO:",
         YOLO is not None
     )
 
     print(
-        "Database configured:",
+        "DATABASE:",
         bool(DATABASE_URL)
     )
 
-    # Make sure directories exist again
-    # before server starts.
-    for directory in REQUIRED_DIRECTORIES:
+    # Make sure folders exist.
+    for directory in DIRECTORIES:
 
         os.makedirs(
             directory,
@@ -2928,29 +4298,20 @@ def main():
         )
 
     # Always create dataset.yaml.
-    try:
-        make_dataset_yaml()
-        print(
-            "YOLO dataset.yaml created:",
-            YOLO_DATASET_YAML
-        )
-    except Exception as e:
-        print(
-            "Could not create dataset.yaml:",
-            e
-        )
+    create_dataset_yaml()
 
-    # Database
     init_database()
 
-    # Server
     server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
+        (
+            "0.0.0.0",
+            PORT
+        ),
         Handler
     )
 
     print(
-        "Server running on port:",
+        "Server running on port",
         PORT
     )
 
@@ -2972,4 +4333,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
