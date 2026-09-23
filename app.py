@@ -1,7 +1,7 @@
 import os
 import io
-import csv
 import json
+import csv
 import base64
 import traceback
 import tempfile
@@ -9,108 +9,103 @@ import shutil
 import threading
 import time
 import uuid
-import re
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ============================================================
 # NEERIKA BUCKET AI
 # Mining Production Bucket Counter
-# Full replacement app.py
+# FULL REPLACEMENT APP
 # ============================================================
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 
+# -----------------------------
+# Optional libraries
+# -----------------------------
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    PSYCOPG2_AVAILABLE = True
+    POSTGRES_AVAILABLE = True
 except Exception:
-    psycopg2 = None
-    RealDictCursor = None
-    PSYCOPG2_AVAILABLE = False
+    POSTGRES_AVAILABLE = False
 
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
 except Exception:
-    YOLO = None
     YOLO_AVAILABLE = False
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except Exception:
-    Image = None
-    PIL_AVAILABLE = False
 
 
 # ============================================================
-# PATHS
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 AI_DIR = os.path.join(BASE_DIR, "ai")
+
 DATASET_DIR = os.path.join(AI_DIR, "dataset")
 
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")
-LABELS_DIR = os.path.join(DATASET_DIR, "labels")
+TRAIN_IMAGES_DIR = os.path.join(
+    DATASET_DIR, "images", "train"
+)
 
-TRAIN_IMAGES = os.path.join(IMAGES_DIR, "train")
-VAL_IMAGES = os.path.join(IMAGES_DIR, "val")
+VAL_IMAGES_DIR = os.path.join(
+    DATASET_DIR, "images", "val"
+)
 
-TRAIN_LABELS = os.path.join(LABELS_DIR, "train")
-VAL_LABELS = os.path.join(LABELS_DIR, "val")
+TRAIN_LABELS_DIR = os.path.join(
+    DATASET_DIR, "labels", "train"
+)
 
-MODEL_DIR = os.path.join(AI_DIR, "models")
-MODEL_OUTPUT = os.path.join(MODEL_DIR, "bucket_best.pt")
+VAL_LABELS_DIR = os.path.join(
+    DATASET_DIR, "labels", "val"
+)
 
-DATASET_YAML = os.path.join(AI_DIR, "bucket_dataset.yaml")
+MODEL_DIR = os.path.join(
+    AI_DIR, "models"
+)
 
-UPLOAD_DIR = os.path.join(AI_DIR, "uploads")
+TRAINING_RUN_DIR = os.path.join(
+    AI_DIR, "training_runs"
+)
 
-for folder in [
-    AI_DIR,
-    DATASET_DIR,
-    IMAGES_DIR,
-    LABELS_DIR,
-    TRAIN_IMAGES,
-    VAL_IMAGES,
-    TRAIN_LABELS,
-    VAL_LABELS,
-    MODEL_DIR,
-    UPLOAD_DIR,
-]:
-    os.makedirs(folder, exist_ok=True)
+DATASET_YAML = os.path.join(
+    AI_DIR, "bucket_dataset.yaml"
+)
+
+MODEL_OUTPUT = os.path.join(
+    MODEL_DIR, "bucket_best.pt"
+)
+
+os.makedirs(TRAIN_IMAGES_DIR, exist_ok=True)
+os.makedirs(VAL_IMAGES_DIR, exist_ok=True)
+os.makedirs(TRAIN_LABELS_DIR, exist_ok=True)
+os.makedirs(VAL_LABELS_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(TRAINING_RUN_DIR, exist_ok=True)
 
 
-# ============================================================
-# SETTINGS
-# ============================================================
+# Render Free settings
+EPOCHS = int(os.environ.get("YOLO_EPOCHS", "20"))
+IMAGE_SIZE = int(os.environ.get("YOLO_IMAGE_SIZE", "320"))
+BATCH_SIZE = int(os.environ.get("YOLO_BATCH", "1"))
+WORKERS = int(os.environ.get("YOLO_WORKERS", "0"))
+DEVICE = os.environ.get("YOLO_DEVICE", "cpu")
 
-PORT = int(os.environ.get("PORT", "10000"))
+MAX_UPLOAD_SIZE = 15 * 1024 * 1024
 
-EPOCHS = 20
-IMAGE_SIZE = 320
-BATCH_SIZE = 1
-WORKERS = 0
-DEVICE = "cpu"
-
-CLASS_ID = 0
-CLASS_NAME = "BUCKET_LOADED"
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-MODEL_DOWNLOAD = "yolo11n.pt"
-
 
 # ============================================================
-# TRAINING STATE
+# GLOBAL STATE
 # ============================================================
 
-training_lock = threading.Lock()
+TRAINING_LOCK = threading.Lock()
 
 TRAINING_STATE = {
     "status": "idle",
@@ -118,11 +113,9 @@ TRAINING_STATE = {
     "progress": 0,
     "epoch": 0,
     "epochs": EPOCHS,
-    "error": "",
-    "model": "",
-    "started_at": "",
-    "finished_at": "",
-    "pid": os.getpid(),
+    "started_at": None,
+    "finished_at": None,
+    "error": None
 }
 
 
@@ -130,182 +123,204 @@ TRAINING_STATE = {
 # DATABASE
 # ============================================================
 
-def db_connection():
+def db_connect():
+    if not POSTGRES_AVAILABLE:
+        return None
+
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL haijawekwa kwenye Render Environment Variables.")
+        return None
 
     return psycopg2.connect(
         DATABASE_URL,
-        connect_timeout=15,
         sslmode="require"
     )
 
 
-def db_execute(sql, params=None, fetch=False, fetchone=False):
+def init_database():
     conn = None
 
     try:
-        conn = db_connection()
+        conn = db_connect()
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params or ())
+        if conn is None:
+            return
 
-            result = None
+        cur = conn.cursor()
 
-            if fetchone:
-                result = cur.fetchone()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bucket_counts (
+                id BIGSERIAL PRIMARY KEY,
+                bucket_type TEXT DEFAULT 'DEFAULT',
+                count INTEGER DEFAULT 1,
+                counted_at TIMESTAMPTZ DEFAULT NOW(),
+                shift TEXT,
+                source TEXT DEFAULT 'camera'
+            )
+        """)
 
-            elif fetch:
-                result = cur.fetchall()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS training_dataset (
+                id BIGSERIAL PRIMARY KEY,
+                filename TEXT UNIQUE NOT NULL,
+                split TEXT DEFAULT 'train',
+                annotations INTEGER DEFAULT 0,
+                annotation_data JSONB DEFAULT '[]'::jsonb,
+                uploaded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
 
-            conn.commit()
-            return result
+        conn.commit()
+        cur.close()
+
+    except Exception:
+        if conn:
+            conn.rollback()
 
     finally:
         if conn:
             conn.close()
 
 
-def init_database():
-    if not PSYCOPG2_AVAILABLE:
-        print("WARNING: psycopg2 haipo.")
-        return
+init_database()
 
-    if not DATABASE_URL:
-        print("WARNING: DATABASE_URL haijawekwa.")
-        return
+
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def db_upsert_image(
+    filename,
+    split="train",
+    annotations=0,
+    annotation_data=None
+):
+    conn = None
 
     try:
-        conn = db_connection()
+        conn = db_connect()
 
-        with conn.cursor() as cur:
+        if conn is None:
+            return
 
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bucket_counts (
-                    id BIGSERIAL PRIMARY KEY,
-                    bucket_type TEXT,
-                    count INTEGER DEFAULT 1,
-                    shift TEXT,
-                    operator_name TEXT,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
+        if annotation_data is None:
+            annotation_data = []
+
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO training_dataset
+                (
+                    filename,
+                    split,
+                    annotations,
+                    annotation_data
                 )
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS training_dataset (
-                    id BIGSERIAL PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    split TEXT DEFAULT 'train',
-                    image_path TEXT,
-                    label_path TEXT,
-                    annotations INTEGER DEFAULT 0,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
+            VALUES
+                (%s, %s, %s, %s::jsonb)
+            ON CONFLICT (filename)
+            DO UPDATE SET
+                split = EXCLUDED.split,
+                annotations = EXCLUDED.annotations,
+                annotation_data = EXCLUDED.annotation_data
+        """, (
+            filename,
+            split,
+            annotations,
+            json.dumps(annotation_data)
+        ))
 
         conn.commit()
-        conn.close()
+        cur.close()
 
-        print("Database initialized.")
+    except Exception:
+        if conn:
+            conn.rollback()
 
-    except Exception as e:
-        print("Database initialization warning:", e)
-
-
-# ============================================================
-# UTILS
-# ============================================================
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    finally:
+        if conn:
+            conn.close()
 
 
-def safe_filename(filename):
-    filename = os.path.basename(filename or "")
+def db_get_image(filename):
+    conn = None
 
-    filename = re.sub(
-        r"[^A-Za-z0-9._-]+",
-        "_",
-        filename
-    )
+    try:
+        conn = db_connect()
 
-    if not filename:
-        filename = "image.jpg"
+        if conn is None:
+            return None
 
-    return filename
+        cur = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
 
+        cur.execute("""
+            SELECT
+                id,
+                filename,
+                split,
+                annotations,
+                annotation_data,
+                uploaded_at
+            FROM training_dataset
+            WHERE filename = %s
+            LIMIT 1
+        """, (filename,))
 
-def json_response(handler, data, status=200):
-    raw = json.dumps(
-        data,
-        ensure_ascii=False
-    ).encode("utf-8")
+        row = cur.fetchone()
 
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.end_headers()
+        cur.close()
 
-    handler.wfile.write(raw)
+        return dict(row) if row else None
 
+    except Exception:
+        return None
 
-def html_response(handler, html, status=200):
-    raw = html.encode("utf-8")
-
-    handler.send_response(status)
-    handler.send_header(
-        "Content-Type",
-        "text/html; charset=utf-8"
-    )
-    handler.send_header(
-        "Content-Length",
-        str(len(raw))
-    )
-    handler.end_headers()
-
-    handler.wfile.write(raw)
+    finally:
+        if conn:
+            conn.close()
 
 
-def file_response(handler, path):
-    if not os.path.exists(path):
-        handler.send_error(404)
-        return
+def db_get_dataset_rows():
+    conn = None
 
-    ext = os.path.splitext(path)[1].lower()
+    try:
+        conn = db_connect()
 
-    content_type = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".txt": "text/plain",
-        ".csv": "text/csv",
-        ".pt": "application/octet-stream",
-    }.get(
-        ext,
-        "application/octet-stream"
-    )
+        if conn is None:
+            return []
 
-    size = os.path.getsize(path)
+        cur = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
 
-    handler.send_response(200)
-    handler.send_header(
-        "Content-Type",
-        content_type
-    )
-    handler.send_header(
-        "Content-Length",
-        str(size)
-    )
-    handler.end_headers()
+        cur.execute("""
+            SELECT
+                filename,
+                split,
+                annotations,
+                annotation_data,
+                uploaded_at
+            FROM training_dataset
+            ORDER BY uploaded_at DESC
+        """)
 
-    with open(path, "rb") as f:
-        shutil.copyfileobj(f, handler.wfile)
+        rows = cur.fetchall()
+
+        cur.close()
+
+        return [dict(x) for x in rows]
+
+    except Exception:
+        return []
+
+    finally:
+        if conn:
+            conn.close()
 
 
 # ============================================================
-# DATASET HELPERS
+# FILE HELPERS
 # ============================================================
 
 IMAGE_EXTENSIONS = {
@@ -316,50 +331,212 @@ IMAGE_EXTENSIONS = {
 }
 
 
-def is_image(filename):
-    return os.path.splitext(filename)[1].lower() in IMAGE_EXTENSIONS
+def safe_filename(name):
+    name = os.path.basename(name)
+
+    allowed = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "._-"
+    )
+
+    cleaned = ""
+
+    for c in name:
+        if c in allowed:
+            cleaned += c
+        else:
+            cleaned += "_"
+
+    if not cleaned:
+        cleaned = "image.jpg"
+
+    return cleaned
 
 
-def image_path_for_split(split, filename):
+def image_path(filename, split="train"):
     filename = safe_filename(filename)
 
     if split == "val":
         return os.path.join(
-            VAL_IMAGES,
+            VAL_IMAGES_DIR,
             filename
         )
 
     return os.path.join(
-        TRAIN_IMAGES,
+        TRAIN_IMAGES_DIR,
         filename
     )
 
 
-def label_path_for_split(split, filename):
+def label_path(filename, split="train"):
     filename = safe_filename(filename)
 
-    base = os.path.splitext(filename)[0] + ".txt"
+    stem = os.path.splitext(filename)[0]
 
     if split == "val":
         return os.path.join(
-            VAL_LABELS,
-            base
+            VAL_LABELS_DIR,
+            stem + ".txt"
         )
 
     return os.path.join(
-        TRAIN_LABELS,
-        base
+        TRAIN_LABELS_DIR,
+        stem + ".txt"
     )
 
 
-def get_annotation_count(split, filename):
-    path = label_path_for_split(
-        split,
-        filename
+def valid_image_filename(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in IMAGE_EXTENSIONS
+
+
+# ============================================================
+# ANNOTATION HELPERS
+# ============================================================
+
+def normalize_box(box):
+    """
+    Accepts:
+      {
+        x: 0..1,
+        y: 0..1,
+        width: 0..1,
+        height: 0..1
+      }
+
+    or pixel-like values.
+
+    Returns normalized YOLO:
+      [class_id, cx, cy, w, h]
+    """
+
+    try:
+        x = float(box.get("x", 0))
+        y = float(box.get("y", 0))
+        w = float(box.get("width", 0))
+        h = float(box.get("height", 0))
+
+        # Already normalized
+        if (
+            0 <= x <= 1 and
+            0 <= y <= 1 and
+            0 <= w <= 1 and
+            0 <= h <= 1
+        ):
+            nx = x
+            ny = y
+            nw = w
+            nh = h
+
+        else:
+            # If frontend accidentally sends pixels,
+            # width/height must also be supplied.
+            image_width = float(
+                box.get("image_width", 0)
+            )
+
+            image_height = float(
+                box.get("image_height", 0)
+            )
+
+            if image_width <= 0 or image_height <= 0:
+                return None
+
+            nx = x / image_width
+            ny = y / image_height
+            nw = w / image_width
+            nh = h / image_height
+
+        if nw <= 0 or nh <= 0:
+            return None
+
+        # Convert top-left x/y to YOLO center
+        cx = nx + (nw / 2.0)
+        cy = ny + (nh / 2.0)
+
+        cx = max(0.0, min(1.0, cx))
+        cy = max(0.0, min(1.0, cy))
+        nw = max(0.0001, min(1.0, nw))
+        nh = max(0.0001, min(1.0, nh))
+
+        return [
+            0,
+            cx,
+            cy,
+            nw,
+            nh
+        ]
+
+    except Exception:
+        return None
+
+
+def boxes_to_yolo(boxes):
+    output = []
+
+    if not isinstance(boxes, list):
+        return output
+
+    for box in boxes:
+
+        if not isinstance(box, dict):
+            continue
+
+        result = normalize_box(box)
+
+        if result is None:
+            continue
+
+        output.append(result)
+
+    return output
+
+
+def write_yolo_label_file(
+    filename,
+    boxes,
+    split="train"
+):
+    path = label_path(
+        filename,
+        split
+    )
+
+    yolo_boxes = boxes_to_yolo(boxes)
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for row in yolo_boxes:
+            f.write(
+                f"{row[0]} "
+                f"{row[1]:.6f} "
+                f"{row[2]:.6f} "
+                f"{row[3]:.6f} "
+                f"{row[4]:.6f}\n"
+            )
+
+    return path, len(yolo_boxes)
+
+
+def read_yolo_label_file(
+    filename,
+    split="train"
+):
+    path = label_path(
+        filename,
+        split
     )
 
     if not os.path.exists(path):
-        return 0
+        return []
+
+    boxes = []
 
     try:
         with open(
@@ -367,166 +544,273 @@ def get_annotation_count(split, filename):
             "r",
             encoding="utf-8"
         ) as f:
-            lines = [
-                x.strip()
-                for x in f
-                if x.strip()
-            ]
 
-        valid = 0
+            for line in f:
+                parts = line.strip().split()
 
-        for line in lines:
-            parts = line.split()
+                if len(parts) != 5:
+                    continue
 
-            if len(parts) >= 5:
-                try:
-                    cls = int(float(parts[0]))
+                class_id = int(float(parts[0]))
 
-                    if cls == CLASS_ID:
-                        valid += 1
+                cx = float(parts[1])
+                cy = float(parts[2])
+                w = float(parts[3])
+                h = float(parts[4])
 
-                except Exception:
-                    pass
+                # Convert YOLO center format to
+                # top-left format for frontend.
+                x = cx - (w / 2.0)
+                y = cy - (h / 2.0)
 
-        return valid
+                boxes.append({
+                    "x": x,
+                    "y": y,
+                    "width": w,
+                    "height": h,
+                    "class_id": class_id
+                })
 
     except Exception:
-        return 0
+        return []
 
-
-def has_valid_bucket_label(split, filename):
-    return get_annotation_count(
-        split,
-        filename
-    ) > 0
-
-
-def find_training_images_with_labels():
-    result = []
-
-    if not os.path.exists(TRAIN_IMAGES):
-        return result
-
-    for filename in sorted(os.listdir(TRAIN_IMAGES)):
-
-        if not is_image(filename):
-            continue
-
-        if has_valid_bucket_label(
-            "train",
-            filename
-        ):
-            result.append(filename)
-
-    return result
-
-
-def find_validation_images_with_labels():
-    result = []
-
-    if not os.path.exists(VAL_IMAGES):
-        return result
-
-    for filename in sorted(os.listdir(VAL_IMAGES)):
-
-        if not is_image(filename):
-            continue
-
-        if has_valid_bucket_label(
-            "val",
-            filename
-        ):
-            result.append(filename)
-
-    return result
+    return boxes
 
 
 # ============================================================
-# IMPORTANT:
-# REBUILD LABELS FROM DATABASE IF NECESSARY
+# DATASET SCAN
 # ============================================================
 
-def ensure_label_file_from_database(
-    filename,
-    split="train"
-):
-    """
-    The browser saves annotation data through /api/dataset/labels.
+def scan_split(split):
+    if split == "val":
+        image_dir = VAL_IMAGES_DIR
+        label_dir = VAL_LABELS_DIR
+    else:
+        image_dir = TRAIN_IMAGES_DIR
+        label_dir = TRAIN_LABELS_DIR
 
-    This function is a safety check.
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(label_dir, exist_ok=True)
 
-    If the physical TXT file exists and contains class 0,
-    nothing is changed.
+    images = []
+    labels = []
 
-    It does NOT invent annotations.
-    """
+    for filename in os.listdir(image_dir):
 
-    path = label_path_for_split(
-        split,
-        filename
-    )
+        if not valid_image_filename(filename):
+            continue
 
-    if not os.path.exists(path):
-        return False
+        images.append(filename)
 
-    return has_valid_bucket_label(
-        split,
-        filename
-    )
+        lp = label_path(
+            filename,
+            split
+        )
+
+        if os.path.exists(lp):
+
+            try:
+                if os.path.getsize(lp) > 0:
+                    labels.append(filename)
+            except Exception:
+                pass
+
+    return images, labels
 
 
-def validate_training_dataset():
-    """
-    Strict dataset validation.
-
-    Returns:
-        {
-            ok,
-            train_images,
-            val_images,
-            train_count,
-            val_count,
-            message
-        }
-    """
-
-    train_images = find_training_images_with_labels()
-
-    if len(train_images) == 0:
-
-        return {
-            "ok": False,
-            "train_images": [],
-            "val_images": [],
-            "train_count": 0,
-            "val_count": 0,
-            "message": (
-                "Hakuna picha yenye BUCKET_LOADED annotation. "
-                "Hakikisha ume-save YOLO labels baada ya kuchora box."
-            )
-        }
-
-    val_images = find_validation_images_with_labels()
+def dataset_stats():
+    train_images, train_labels = scan_split("train")
+    val_images, val_labels = scan_split("val")
 
     return {
-        "ok": True,
-        "train_images": train_images,
-        "val_images": val_images,
-        "train_count": len(train_images),
-        "val_count": len(val_images),
-        "message": "Dataset iko tayari."
+        "training_images": len(train_images),
+        "validation_images": len(val_images),
+        "training_labels": len(train_labels),
+        "validation_labels": len(val_labels),
+        "unlabeled_training": max(
+            0,
+            len(train_images) - len(train_labels)
+        ),
+        "unlabeled_validation": max(
+            0,
+            len(val_images) - len(val_labels)
+        )
     }
 
 
 # ============================================================
-# DATASET YAML
+# REBUILD LABELS FROM SUPABASE
 # ============================================================
 
-def write_dataset_yaml():
+def restore_annotations_from_database():
+    """
+    If Render filesystem lost .txt files but Supabase
+    still has annotation_data, rebuild the YOLO labels.
+    """
 
-    os.makedirs(AI_DIR, exist_ok=True)
+    rows = db_get_dataset_rows()
 
-    yaml_text = f"""path: {DATASET_DIR}
+    restored = 0
+
+    for row in rows:
+
+        filename = row.get("filename")
+        split = row.get("split") or "train"
+
+        annotation_data = (
+            row.get("annotation_data")
+            or []
+        )
+
+        if not filename:
+            continue
+
+        if not annotation_data:
+            continue
+
+        try:
+            path, count = write_yolo_label_file(
+                filename,
+                annotation_data,
+                split
+            )
+
+            if count > 0:
+                restored += 1
+
+        except Exception:
+            pass
+
+    return restored
+
+
+# ============================================================
+# DATASET VALIDATION
+# ============================================================
+
+def validate_training_dataset():
+    restore_annotations_from_database()
+
+    train_images, train_labels = scan_split(
+        "train"
+    )
+
+    valid = []
+
+    for filename in train_labels:
+
+        path = label_path(
+            filename,
+            "train"
+        )
+
+        try:
+            with open(
+                path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                found_bucket = False
+
+                for line in f:
+
+                    parts = line.strip().split()
+
+                    if len(parts) != 5:
+                        continue
+
+                    if int(float(parts[0])) == 0:
+                        found_bucket = True
+                        break
+
+                if found_bucket:
+                    valid.append(filename)
+
+        except Exception:
+            pass
+
+    return valid
+
+
+# ============================================================
+# VALIDATION FALLBACK
+# ============================================================
+
+def prepare_validation_dataset():
+
+    train_images, train_labels = scan_split(
+        "train"
+    )
+
+    if not train_labels:
+        return False
+
+    val_images, val_labels = scan_split(
+        "val"
+    )
+
+    # If validation already exists, use it.
+    if val_labels:
+        return True
+
+    # Use one training image as validation fallback.
+    source_filename = train_labels[0]
+
+    source_image = os.path.join(
+        TRAIN_IMAGES_DIR,
+        source_filename
+    )
+
+    source_label = os.path.join(
+        TRAIN_LABELS_DIR,
+        os.path.splitext(
+            source_filename
+        )[0] + ".txt"
+    )
+
+    destination_image = os.path.join(
+        VAL_IMAGES_DIR,
+        source_filename
+    )
+
+    destination_label = os.path.join(
+        VAL_LABELS_DIR,
+        os.path.splitext(
+            source_filename
+        )[0] + ".txt"
+    )
+
+    try:
+
+        shutil.copy2(
+            source_image,
+            destination_image
+        )
+
+        shutil.copy2(
+            source_label,
+            destination_label
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# YOLO DATASET YAML
+# ============================================================
+
+def create_dataset_yaml():
+
+    dataset_path = DATASET_DIR.replace(
+        "\\",
+        "/"
+    )
+
+    text = f"""path: {dataset_path}
 train: images/train
 val: images/val
 
@@ -539,128 +823,49 @@ names:
         "w",
         encoding="utf-8"
     ) as f:
-        f.write(yaml_text)
+
+        f.write(text)
 
     return DATASET_YAML
 
 
 # ============================================================
-# VALIDATION FALLBACK
+# TRAINING PROGRESS
 # ============================================================
 
-def create_validation_fallback():
+def update_training(
+    status=None,
+    message=None,
+    progress=None,
+    epoch=None,
+    error=None
+):
 
-    """
-    Render Free test mode:
+    if status is not None:
+        TRAINING_STATE["status"] = status
 
-    If user has training images but no validation images,
-    copy one labeled training image to validation.
+    if message is not None:
+        TRAINING_STATE["message"] = message
 
-    This is ONLY a pipeline fallback.
-    For serious model training, upload separate validation images.
-    """
-
-    val_existing = find_validation_images_with_labels()
-
-    if val_existing:
-        return val_existing
-
-    train_existing = find_training_images_with_labels()
-
-    if not train_existing:
-        return []
-
-    source_name = train_existing[0]
-
-    source_image = os.path.join(
-        TRAIN_IMAGES,
-        source_name
-    )
-
-    source_label = os.path.join(
-        TRAIN_LABELS,
-        os.path.splitext(source_name)[0] + ".txt"
-    )
-
-    val_image = os.path.join(
-        VAL_IMAGES,
-        source_name
-    )
-
-    val_label = os.path.join(
-        VAL_LABELS,
-        os.path.splitext(source_name)[0] + ".txt"
-    )
-
-    try:
-
-        shutil.copy2(
-            source_image,
-            val_image
+    if progress is not None:
+        TRAINING_STATE["progress"] = int(
+            max(0, min(100, progress))
         )
 
-        shutil.copy2(
-            source_label,
-            val_label
+    if epoch is not None:
+        TRAINING_STATE["epoch"] = int(
+            epoch
         )
 
-        print(
-            "Validation fallback created:",
-            source_name
-        )
-
-        return [source_name]
-
-    except Exception as e:
-
-        print(
-            "Validation fallback failed:",
-            e
-        )
-
-        return []
+    if error is not None:
+        TRAINING_STATE["error"] = error
 
 
 # ============================================================
 # YOLO CALLBACK
 # ============================================================
 
-def update_training_epoch(epoch_number, total_epochs):
-
-    try:
-
-        epoch_number = int(epoch_number)
-        total_epochs = int(total_epochs)
-
-        TRAINING_STATE["epoch"] = epoch_number
-
-        # 10% reserved for preparation.
-        # Remaining 90% belongs to epochs.
-        progress = 10 + int(
-            (epoch_number / max(total_epochs, 1))
-            * 90
-        )
-
-        progress = max(
-            10,
-            min(
-                progress,
-                99
-            )
-        )
-
-        TRAINING_STATE["progress"] = progress
-
-        TRAINING_STATE["message"] = (
-            f"Training YOLO... "
-            f"Epoch {epoch_number}/{total_epochs}"
-        )
-
-    except Exception:
-        pass
-
-
-def training_callback(trainer):
+def training_epoch_callback(trainer):
 
     try:
 
@@ -672,9 +877,6 @@ def training_callback(trainer):
             )
         )
 
-        # Ultralytics epoch is zero based.
-        current = epoch + 1
-
         total = int(
             getattr(
                 trainer,
@@ -683,1607 +885,380 @@ def training_callback(trainer):
             )
         )
 
-        update_training_epoch(
-            current,
-            total
+        progress = int(
+            ((epoch + 1) / total) * 100
         )
 
-        print(
-            f"NEERIKA TRAINING EPOCH "
-            f"{current}/{total}"
+        update_training(
+            status="training",
+            message=(
+                f"Training epoch "
+                f"{epoch + 1}/{total}"
+            ),
+            progress=progress,
+            epoch=epoch + 1
         )
 
-    except Exception as e:
-
-        print(
-            "Training callback warning:",
-            e
-        )
+    except Exception:
+        pass
 
 
 # ============================================================
 # TRAINING WORKER
 # ============================================================
 
-def train_yolo_worker():
+def training_worker():
 
-    try:
-
-        TRAINING_STATE["status"] = "preparing"
-        TRAINING_STATE["progress"] = 1
-        TRAINING_STATE["epoch"] = 0
-        TRAINING_STATE["error"] = ""
-        TRAINING_STATE["started_at"] = now_iso()
-        TRAINING_STATE["finished_at"] = ""
-        TRAINING_STATE["model"] = ""
-
-        print("=" * 60)
-        print("NEERIKA YOLO TRAINING START")
-        print("=" * 60)
-
-        if not YOLO_AVAILABLE:
-            raise RuntimeError(
-                "Ultralytics haija-install."
-            )
-
-        TRAINING_STATE["message"] = (
-            "Checking BUCKET_LOADED annotations..."
-        )
-
-        TRAINING_STATE["progress"] = 3
-
-        dataset = validate_training_dataset()
-
-        print(
-            "TRAINING DATASET:",
-            json.dumps(
-                dataset,
-                ensure_ascii=False
-            )
-        )
-
-        if not dataset["ok"]:
-
-            raise RuntimeError(
-                dataset["message"]
-            )
-
-        TRAINING_STATE["message"] = (
-            f"Found {dataset['train_count']} "
-            f"labeled training image(s)."
-        )
-
-        TRAINING_STATE["progress"] = 5
-
-        # ----------------------------------------------------
-        # Validation fallback
-        # ----------------------------------------------------
-
-        val_images = create_validation_fallback()
-
-        if not val_images:
-            raise RuntimeError(
-                "Hakuna validation image yenye "
-                "BUCKET_LOADED annotation."
-            )
-
-        TRAINING_STATE["message"] = (
-            f"Validation ready: "
-            f"{len(val_images)} image(s)."
-        )
-
-        TRAINING_STATE["progress"] = 8
-
-        # ----------------------------------------------------
-        # Dataset YAML
-        # ----------------------------------------------------
-
-        write_dataset_yaml()
-
-        print(
-            "Dataset YAML:",
-            DATASET_YAML
-        )
-
-        TRAINING_STATE["progress"] = 10
-
-        # ----------------------------------------------------
-        # Load model
-        # ----------------------------------------------------
-
-        TRAINING_STATE["status"] = "loading_model"
-
-        TRAINING_STATE["message"] = (
-            "Loading YOLO model..."
-        )
-
-        print(
-            "Loading YOLO model:",
-            MODEL_DOWNLOAD
-        )
-
-        model = YOLO(
-            MODEL_DOWNLOAD
-        )
-
-        TRAINING_STATE["progress"] = 12
-
-        # ----------------------------------------------------
-        # Register callback
-        # ----------------------------------------------------
+    with TRAINING_LOCK:
 
         try:
-            model.add_callback(
-                "on_train_epoch_end",
-                training_callback
+
+            update_training(
+                status="preparing",
+                message="Checking dataset...",
+                progress=1,
+                epoch=0,
+                error=None
             )
 
-            print(
-                "Registered callback: "
-                "on_train_epoch_end"
+            # Restore any labels saved in Supabase.
+            restore_annotations_from_database()
+
+            valid_images = (
+                validate_training_dataset()
             )
+
+            if not valid_images:
+
+                update_training(
+                    status="error",
+                    message=(
+                        "Hakuna picha yenye "
+                        "BUCKET_LOADED annotation. "
+                        "Fungua picha, chora box kwenye "
+                        "bucket iliyobeba ore, kisha "
+                        "bonyeza Save YOLO Labels."
+                    ),
+                    progress=0,
+                    epoch=0,
+                    error="NO_BUCKET_LABELS"
+                )
+
+                return
+
+            update_training(
+                status="preparing",
+                message=(
+                    f"Dataset ready: "
+                    f"{len(valid_images)} labeled image(s)."
+                ),
+                progress=5,
+                epoch=0
+            )
+
+            # Prepare validation.
+            prepare_validation_dataset()
+
+            create_dataset_yaml()
+
+            if not YOLO_AVAILABLE:
+
+                update_training(
+                    status="error",
+                    message=(
+                        "Ultralytics YOLO haipatikani. "
+                        "Hakikisha requirements.txt ina "
+                        "ultralytics."
+                    ),
+                    progress=0,
+                    epoch=0,
+                    error="YOLO_NOT_AVAILABLE"
+                )
+
+                return
+
+            update_training(
+                status="loading",
+                message=(
+                    "Loading YOLO model..."
+                ),
+                progress=7,
+                epoch=0
+            )
+
+            model = YOLO(
+                "yolo11n.pt"
+            )
+
+            # Register callback.
+            try:
+                model.add_callback(
+                    "on_train_epoch_end",
+                    training_epoch_callback
+                )
+            except Exception:
+                pass
+
+            update_training(
+                status="training",
+                message=(
+                    "YOLO training inaanza..."
+                ),
+                progress=8,
+                epoch=0
+            )
+
+            run_name = (
+                "bucket_training_"
+                + datetime.now().strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+            )
+
+            project_dir = AI_DIR
+
+            # ------------------------------------------------
+            # ACTUAL TRAINING
+            # ------------------------------------------------
+
+            results = model.train(
+
+                data=DATASET_YAML,
+
+                epochs=EPOCHS,
+
+                imgsz=IMAGE_SIZE,
+
+                batch=BATCH_SIZE,
+
+                workers=WORKERS,
+
+                device=DEVICE,
+
+                project=project_dir,
+
+                name=run_name,
+
+                exist_ok=True,
+
+                pretrained=True,
+
+                verbose=True,
+
+                cache=False,
+
+                amp=False,
+
+                plots=False,
+
+                save=True,
+
+                val=True,
+
+                patience=100
+
+            )
+
+            update_training(
+                status="finalizing",
+                message=(
+                    "Training imekamilika. "
+                    "Searching best model..."
+                ),
+                progress=98,
+                epoch=EPOCHS
+            )
+
+            run_dir = os.path.join(
+                project_dir,
+                run_name
+            )
+
+            candidates = [
+
+                os.path.join(
+                    run_dir,
+                    "weights",
+                    "best.pt"
+                ),
+
+                os.path.join(
+                    run_dir,
+                    "weights",
+                    "last.pt"
+                )
+
+            ]
+
+            model_found = None
+
+            for candidate in candidates:
+
+                if os.path.exists(candidate):
+
+                    model_found = candidate
+                    break
+
+            if model_found:
+
+                shutil.copy2(
+                    model_found,
+                    MODEL_OUTPUT
+                )
+
+                update_training(
+                    status="completed",
+                    message=(
+                        "Training completed successfully. "
+                        "Model saved as bucket_best.pt"
+                    ),
+                    progress=100,
+                    epoch=EPOCHS
+                )
+
+            else:
+
+                update_training(
+                    status="error",
+                    message=(
+                        "Training imekwisha lakini "
+                        "best.pt/last.pt haikupatikana."
+                    ),
+                    progress=0,
+                    epoch=EPOCHS,
+                    error="MODEL_NOT_FOUND"
+                )
 
         except Exception as e:
 
+            error_text = (
+                f"{type(e).__name__}: {str(e)}"
+            )
+
             print(
-                "Callback registration warning:",
-                e
+                "TRAINING ERROR:",
+                error_text
             )
 
-        # ----------------------------------------------------
-        # Training directory
-        # ----------------------------------------------------
+            traceback.print_exc()
 
-        run_dir = os.path.join(
-            AI_DIR,
-            "bucket_training"
-        )
-
-        os.makedirs(
-            run_dir,
-            exist_ok=True
-        )
-
-        # ----------------------------------------------------
-        # Start training
-        # ----------------------------------------------------
-
-        TRAINING_STATE["status"] = "training"
-
-        TRAINING_STATE["message"] = (
-            f"Training YOLO for {EPOCHS} epochs..."
-        )
-
-        TRAINING_STATE["progress"] = 12
-
-        print("=" * 60)
-        print("STARTING YOLO TRAINING")
-        print("DEVICE:", DEVICE)
-        print("IMAGE SIZE:", IMAGE_SIZE)
-        print("BATCH:", BATCH_SIZE)
-        print("WORKERS:", WORKERS)
-        print("EPOCHS:", EPOCHS)
-        print("TRAIN IMAGES:", dataset["train_count"])
-        print("VAL IMAGES:", len(val_images))
-        print("=" * 60)
-
-        results = model.train(
-
-            data=DATASET_YAML,
-
-            epochs=EPOCHS,
-
-            imgsz=IMAGE_SIZE,
-
-            batch=BATCH_SIZE,
-
-            workers=WORKERS,
-
-            device=DEVICE,
-
-            project=AI_DIR,
-
-            name="bucket_training",
-
-            exist_ok=True,
-
-            pretrained=True,
-
-            verbose=True,
-
-            cache=False,
-
-            amp=False,
-
-            plots=False,
-
-            save=True,
-
-            val=True,
-
-            patience=100
-        )
-
-        # ----------------------------------------------------
-        # Training finished
-        # ----------------------------------------------------
-
-        print(
-            "YOLO TRAINING FINISHED"
-        )
-
-        TRAINING_STATE["progress"] = 95
-
-        TRAINING_STATE["message"] = (
-            "Training finished. Searching for best.pt..."
-        )
-
-        # ----------------------------------------------------
-        # Find best.pt
-        # ----------------------------------------------------
-
-        candidates = [
-
-            os.path.join(
-                AI_DIR,
-                "bucket_training",
-                "weights",
-                "best.pt"
-            ),
-
-            os.path.join(
-                AI_DIR,
-                "bucket_training",
-                "weights",
-                "last.pt"
-            ),
-
-            os.path.join(
-                run_dir,
-                "weights",
-                "best.pt"
-            ),
-
-            os.path.join(
-                run_dir,
-                "weights",
-                "last.pt"
-            ),
-        ]
-
-        best_source = None
-
-        for candidate in candidates:
-
-            if os.path.exists(candidate):
-
-                best_source = candidate
-
-                print(
-                    "Found model:",
-                    candidate
-                )
-
-                break
-
-        if not best_source:
-
-            raise RuntimeError(
-                "Training imekamilika lakini "
-                "best.pt/last.pt haikupatikana."
+            update_training(
+                status="error",
+                message=(
+                    "Training error: "
+                    + error_text
+                ),
+                progress=0,
+                error=error_text
             )
 
-        os.makedirs(
-            MODEL_DIR,
-            exist_ok=True
-        )
-
-        shutil.copy2(
-            best_source,
-            MODEL_OUTPUT
-        )
-
-        print(
-            "Model copied to:",
-            MODEL_OUTPUT
-        )
-
-        TRAINING_STATE["status"] = "completed"
-
-        TRAINING_STATE["progress"] = 100
-
-        TRAINING_STATE["epoch"] = EPOCHS
-
-        TRAINING_STATE["message"] = (
-            "Training completed successfully."
-        )
-
-        TRAINING_STATE["model"] = MODEL_OUTPUT
-
-        TRAINING_STATE["finished_at"] = now_iso()
-
-        print("=" * 60)
-        print("NEERIKA TRAINING COMPLETED")
-        print("=" * 60)
-
-    except Exception as e:
-
-        error_text = (
-            str(e)
-            or traceback.format_exc()
-        )
-
-        print("=" * 60)
-        print("YOLO TRAINING ERROR")
-        print(error_text)
-        print("=" * 60)
-
-        traceback.print_exc()
-
-        TRAINING_STATE["status"] = "error"
-
-        TRAINING_STATE["progress"] = 0
-
-        TRAINING_STATE["epoch"] = 0
-
-        TRAINING_STATE["message"] = (
-            "Training error: " + str(e)
-        )
-
-        TRAINING_STATE["error"] = traceback.format_exc()
-
-        TRAINING_STATE["finished_at"] = now_iso()
-
-    finally:
-
-        training_lock.release()
-
 
 # ============================================================
-# START TRAINING
-# ============================================================
-
-def start_training():
-
-    acquired = training_lock.acquire(
-        blocking=False
-    )
-
-    if not acquired:
-
-        return False, (
-            "Training tayari inaendelea."
-        )
-
-    try:
-
-        if TRAINING_STATE["status"] in [
-            "preparing",
-            "loading_model",
-            "training"
-        ]:
-
-            training_lock.release()
-
-            return False, (
-                "Training tayari inaendelea."
-            )
-
-        # Reset immediately.
-        TRAINING_STATE["status"] = "starting"
-        TRAINING_STATE["message"] = (
-            "Starting training..."
-        )
-        TRAINING_STATE["progress"] = 1
-        TRAINING_STATE["epoch"] = 0
-        TRAINING_STATE["error"] = ""
-
-        thread = threading.Thread(
-            target=train_yolo_worker,
-            daemon=True
-        )
-
-        thread.start()
-
-        return True, (
-            "Training started."
-        )
-
-    except Exception:
-
-        try:
-            training_lock.release()
-        except Exception:
-            pass
-
-        raise
-
-
-# ============================================================
-# DATASET STATS
-# ============================================================
-
-def dataset_stats():
-
-    train_images = [
-        f
-        for f in os.listdir(TRAIN_IMAGES)
-        if is_image(f)
-    ]
-
-    val_images = [
-        f
-        for f in os.listdir(VAL_IMAGES)
-        if is_image(f)
-    ]
-
-    train_labeled = sum(
-        1
-        for f in train_images
-        if has_valid_bucket_label(
-            "train",
-            f
-        )
-    )
-
-    val_labeled = sum(
-        1
-        for f in val_images
-        if has_valid_bucket_label(
-            "val",
-            f
-        )
-    )
-
-    return {
-        "training_images": len(train_images),
-        "validation_images": len(val_images),
-        "training_labels": train_labeled,
-        "validation_labels": val_labeled,
-        "unlabeled_training": (
-            len(train_images) - train_labeled
-        ),
-        "unlabeled_validation": (
-            len(val_images) - val_labeled
-        )
-    }
-
-
-# ============================================================
-# DATASET IMAGE LIST
-# ============================================================
-
-def dataset_images(split):
-
-    directory = (
-        VAL_IMAGES
-        if split == "val"
-        else TRAIN_IMAGES
-    )
-
-    results = []
-
-    if not os.path.exists(directory):
-        return results
-
-    for filename in sorted(
-        os.listdir(directory),
-        reverse=True
-    ):
-
-        if not is_image(filename):
-            continue
-
-        results.append({
-            "filename": filename,
-            "split": split,
-            "annotations": get_annotation_count(
-                split,
-                filename
-            )
-        })
-
-    return results
-
-
-# ============================================================
-# MULTIPART PARSER
-# ============================================================
-
-def parse_multipart(handler):
-
-    content_type = handler.headers.get(
-        "Content-Type",
-        ""
-    )
-
-    content_length = int(
-        handler.headers.get(
-            "Content-Length",
-            "0"
-        )
-    )
-
-    body = handler.rfile.read(
-        content_length
-    )
-
-    fields = {}
-    files = {}
-
-    if "boundary=" not in content_type:
-        return fields, files
-
-    boundary = content_type.split(
-        "boundary=",
-        1
-    )[1]
-
-    boundary = boundary.strip()
-
-    if boundary.startswith('"') and boundary.endswith('"'):
-        boundary = boundary[1:-1]
-
-    marker = (
-        b"--" +
-        boundary.encode()
-    )
-
-    parts = body.split(marker)
-
-    for part in parts:
-
-        if not part:
-            continue
-
-        if part in [
-            b"--",
-            b"--\r\n"
-        ]:
-            continue
-
-        if part.startswith(b"\r\n"):
-            part = part[2:]
-
-        if part.endswith(b"\r\n"):
-            part = part[:-2]
-
-        header_end = part.find(
-            b"\r\n\r\n"
-        )
-
-        if header_end == -1:
-            continue
-
-        raw_headers = part[
-            :header_end
-        ]
-
-        content = part[
-            header_end + 4:
-        ]
-
-        header_text = raw_headers.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
-        disposition = ""
-
-        for line in header_text.split(
-            "\r\n"
-        ):
-
-            if line.lower().startswith(
-                "content-disposition:"
-            ):
-                disposition = line
-
-        name_match = re.search(
-            r'name="([^"]+)"',
-            disposition
-        )
-
-        if not name_match:
-            continue
-
-        field_name = name_match.group(1)
-
-        filename_match = re.search(
-            r'filename="([^"]*)"',
-            disposition
-        )
-
-        if filename_match:
-
-            filename = filename_match.group(1)
-
-            files[field_name] = {
-                "filename": filename,
-                "content": content
-            }
-
-        else:
-
-            fields[field_name] = content.decode(
-                "utf-8",
-                errors="replace"
-            )
-
-    return fields, files
-
-
-# ============================================================
-# HTML
-# ============================================================
-
-HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width, initial-scale=1.0"
->
-
-<title>NEERIKA BUCKET AI</title>
-
-<style>
-
-*{
-box-sizing:border-box;
-}
-
-body{
-margin:0;
-font-family:Arial,Helvetica,sans-serif;
-background:#f4f6f8;
-color:#17202a;
-}
-
-header{
-background:#111827;
-color:white;
-padding:18px;
-}
-
-header h1{
-margin:0;
-font-size:22px;
-}
-
-header p{
-margin:5px 0 0;
-opacity:.8;
-}
-
-nav{
-display:flex;
-gap:5px;
-overflow:auto;
-background:#1f2937;
-padding:8px;
-}
-
-nav button{
-border:0;
-background:#374151;
-color:white;
-padding:11px 15px;
-border-radius:7px;
-cursor:pointer;
-white-space:nowrap;
-}
-
-nav button.active{
-background:#f59e0b;
-color:#111;
-}
-
-main{
-max-width:1100px;
-margin:auto;
-padding:15px;
-}
-
-.tab{
-display:none;
-}
-
-.tab.active{
-display:block;
-}
-
-.card{
-background:white;
-border-radius:12px;
-padding:16px;
-margin-bottom:15px;
-box-shadow:0 2px 8px rgba(0,0,0,.08);
-}
-
-button{
-padding:10px 14px;
-border:0;
-border-radius:7px;
-background:#2563eb;
-color:white;
-cursor:pointer;
-}
-
-button.danger{
-background:#dc2626;
-}
-
-button.success{
-background:#16a34a;
-}
-
-button:disabled{
-opacity:.5;
-cursor:not-allowed;
-}
-
-input,select{
-padding:10px;
-border:1px solid #d1d5db;
-border-radius:7px;
-width:100%;
-margin:5px 0 10px;
-}
-
-.progress{
-height:22px;
-background:#e5e7eb;
-border-radius:20px;
-overflow:hidden;
-margin:10px 0;
-}
-
-.progress-bar{
-height:100%;
-width:0%;
-background:#16a34a;
-color:white;
-text-align:center;
-font-size:13px;
-line-height:22px;
-transition:width .3s;
-}
-
-.status{
-padding:12px;
-border-radius:8px;
-background:#f3f4f6;
-margin:10px 0;
-}
-
-table{
-width:100%;
-border-collapse:collapse;
-}
-
-th,td{
-padding:9px;
-border-bottom:1px solid #ddd;
-text-align:left;
-}
-
-.small{
-font-size:13px;
-color:#6b7280;
-}
-
-.badge{
-display:inline-block;
-padding:4px 8px;
-border-radius:20px;
-font-size:12px;
-background:#dcfce7;
-color:#166534;
-}
-
-.error{
-background:#fee2e2;
-color:#991b1b;
-}
-
-.successbox{
-background:#dcfce7;
-color:#166534;
-}
-
-footer{
-text-align:center;
-padding:20px;
-color:#777;
-}
-
-#preview{
-max-width:100%;
-margin-top:10px;
-border-radius:10px;
-}
-
-</style>
-</head>
-
-<body>
-
-<header>
-<h1>NEERIKA BUCKET AI</h1>
-<p>Mining Production Bucket Counter</p>
-</header>
-
-<nav>
-<button onclick="showTab('dashboard')" id="nav-dashboard">Dashboard</button>
-<button onclick="showTab('camera')" id="nav-camera">Camera</button>
-<button onclick="showTab('buckets')" id="nav-buckets">Buckets</button>
-<button onclick="showTab('training')" id="nav-training">Training</button>
-<button onclick="showTab('history')" id="nav-history">History</button>
-<button onclick="showTab('settings')" id="nav-settings">Settings</button>
-</nav>
-
-<main>
-
-<section id="dashboard" class="tab">
-
-<div class="card">
-
-<h2>Dashboard</h2>
-
-<p>
-NEERIKA BUCKET AI counts loaded ore/material buckets.
-</p>
-
-<div id="dashboardStats">
-Loading...
-</div>
-
-</div>
-
-</section>
-
-
-<section id="camera" class="tab">
-
-<div class="card">
-
-<h2>Camera</h2>
-
-<p>
-Camera counting interface.
-</p>
-
-<video
-id="cameraVideo"
-autoplay
-playsinline
-style="width:100%;max-width:700px;background:#111;border-radius:10px;"
-></video>
-
-<br><br>
-
-<button onclick="startCamera()">
-Start Camera
-</button>
-
-<button onclick="stopCamera()">
-Stop Camera
-</button>
-
-</div>
-
-</section>
-
-
-<section id="buckets" class="tab">
-
-<div class="card">
-
-<h2>Bucket Types</h2>
-
-<p>
-Bucket reference management.
-</p>
-
-<p class="small">
-Active bucket type: BUCKET_LOADED
-</p>
-
-</div>
-
-</section>
-
-
-<section id="training" class="tab">
-
-<div class="card">
-
-<h2>YOLO Training Dataset</h2>
-
-<p>
-Upload images and annotate them as
-<strong>BUCKET_LOADED</strong>.
-</p>
-
-<form
-id="uploadForm"
-enctype="multipart/form-data"
->
-
-<input
-type="file"
-name="image"
-id="imageInput"
-accept="image/*"
-required
->
-
-<select name="split" id="split">
-<option value="train">Training</option>
-<option value="val">Validation</option>
-</select>
-
-<button type="submit">
-Upload Image
-</button>
-
-</form>
-
-<div id="uploadMessage"></div>
-
-</div>
-
-
-<div class="card">
-
-<h2>Training Status</h2>
-
-<div
-id="trainingStatus"
-class="status"
->
-Loading...
-</div>
-
-<div class="progress">
-<div
-id="trainingProgress"
-class="progress-bar"
->
-0%
-</div>
-</div>
-
-<p id="epochText">
-Epoch: 0 / 20
-</p>
-
-<button
-id="startTraining"
-class="success"
-onclick="startTraining()"
->
-Start Training
-</button>
-
-<button onclick="refreshTraining()">
-Refresh
-</button>
-
-</div>
-
-
-<div class="card">
-
-<h2>Training Settings</h2>
-
-<table>
-
-<tr>
-<td>CPU</td>
-<td>CPU</td>
-</tr>
-
-<tr>
-<td>Image Size</td>
-<td>320</td>
-</tr>
-
-<tr>
-<td>Batch</td>
-<td>1</td>
-</tr>
-
-<tr>
-<td>Workers</td>
-<td>0</td>
-</tr>
-
-<tr>
-<td>Epochs</td>
-<td>20</td>
-</tr>
-
-</table>
-
-<p class="small">
-These settings are optimized for Render Free.
-</p>
-
-</div>
-
-
-<div class="card">
-
-<h2>Dataset</h2>
-
-<div id="datasetStats">
-Loading...
-</div>
-
-<div style="overflow:auto">
-
-<table>
-
-<thead>
-<tr>
-<th>Split</th>
-<th>Filename</th>
-<th>Annotations</th>
-</tr>
-</thead>
-
-<tbody id="datasetTable">
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-</section>
-
-
-<section id="history" class="tab">
-
-<div class="card">
-
-<h2>History</h2>
-
-<div id="historyData">
-Loading...
-</div>
-
-</div>
-
-</section>
-
-
-<section id="settings" class="tab">
-
-<div class="card">
-
-<h2>Settings</h2>
-
-<p>
-NEERIKA BUCKET AI
-</p>
-
-<p class="small">
-Geology & Mining Services
-</p>
-
-</div>
-
-</section>
-
-</main>
-
-<footer>
-Geology & Mining Services
-</footer>
-
-
-<script>
-
-let cameraStream = null;
-
-function showTab(name){
-
-document.querySelectorAll('.tab')
-.forEach(x => x.classList.remove('active'));
-
-document.querySelectorAll('nav button')
-.forEach(x => x.classList.remove('active'));
-
-const tab = document.getElementById(name);
-
-const nav = document.getElementById(
-'nav-' + name
-);
-
-if(tab){
-tab.classList.add('active');
-}
-
-if(nav){
-nav.classList.add('active');
-}
-
-if(name === 'training'){
-loadDataset();
-refreshTraining();
-}
-
-if(name === 'dashboard'){
-loadDashboard();
-}
-
-}
-
-async function api(url, options){
-
-const response = await fetch(
-url,
-options
-);
-
-let data;
-
-try{
-data = await response.json();
-}catch(e){
-data = {
-error:'Invalid server response'
-};
-}
-
-if(!response.ok){
-throw new Error(
-data.error ||
-data.message ||
-'Request failed'
-);
-}
-
-return data;
-}
-
-
-async function refreshTraining(){
-
-try{
-
-const data = await api(
-'/api/training/status'
-);
-
-const status = document.getElementById(
-'trainingStatus'
-);
-
-const progress = document.getElementById(
-'trainingProgress'
-);
-
-const epoch = document.getElementById(
-'epochText'
-);
-
-status.className = 'status';
-
-if(data.status === 'error'){
-status.classList.add('error');
-}
-
-if(data.status === 'completed'){
-status.classList.add('successbox');
-}
-
-status.innerHTML =
-'<strong>Status:</strong> ' +
-escapeHtml(data.status || '') +
-'<br>' +
-escapeHtml(data.message || '');
-
-const p = Number(
-data.progress || 0
-);
-
-progress.style.width =
-p + '%';
-
-progress.textContent =
-p + '%';
-
-epoch.textContent =
-'Epoch: ' +
-Number(data.epoch || 0) +
-' / ' +
-Number(data.epochs || 20);
-
-const button = document.getElementById(
-'startTraining'
-);
-
-if(
-data.status === 'training' ||
-data.status === 'preparing' ||
-data.status === 'loading_model' ||
-data.status === 'starting'
-){
-
-button.disabled = true;
-button.textContent =
-'Training in progress...';
-
-}else{
-
-button.disabled = false;
-button.textContent =
-'Start Training';
-
-}
-
-}catch(e){
-
-console.error(e);
-
-}
-
-}
-
-
-async function startTraining(){
-
-const button = document.getElementById(
-'startTraining'
-);
-
-button.disabled = true;
-
-try{
-
-const data = await api(
-'/api/training/start',
-{
-method:'POST'
-}
-);
-
-alert(
-data.message ||
-'Training started.'
-);
-
-}catch(e){
-
-alert(
-e.message
-);
-
-button.disabled = false;
-
-}
-
-refreshTraining();
-
-}
-
-
-async function loadDataset(){
-
-try{
-
-const stats = await api(
-'/api/dataset/stats'
-);
-
-document.getElementById(
-'datasetStats'
-).innerHTML = `
-
-<p>
-Training Images:
-<strong>${stats.training_images}</strong>
-</p>
-
-<p>
-Validation Images:
-<strong>${stats.validation_images}</strong>
-</p>
-
-<p>
-Training Labels:
-<strong>${stats.training_labels}</strong>
-</p>
-
-<p>
-Validation Labels:
-<strong>${stats.validation_labels}</strong>
-</p>
-
-<p>
-Unlabeled Training:
-<strong>${stats.unlabeled_training}</strong>
-</p>
-
-<p>
-Unlabeled Validation:
-<strong>${stats.unlabeled_validation}</strong>
-</p>
-
-`;
-
-const train = await api(
-'/api/dataset/images?split=train'
-);
-
-const val = await api(
-'/api/dataset/images?split=val'
-);
-
-const all = [
-...(train.images || []),
-...(val.images || [])
-];
-
-const tbody = document.getElementById(
-'datasetTable'
-);
-
-tbody.innerHTML = '';
-
-for(const item of all){
-
-const tr = document.createElement('tr');
-
-tr.innerHTML = `
-
-<td>
-${escapeHtml(item.split)}
-</td>
-
-<td>
-${escapeHtml(item.filename)}
-</td>
-
-<td>
-<span class="badge">
-${item.annotations}
-</span>
-</td>
-
-`;
-
-tbody.appendChild(tr);
-
-}
-
-}catch(e){
-
-console.error(e);
-
-}
-
-}
-
-
-document.getElementById(
-'uploadForm'
-).addEventListener(
-'submit',
-async function(e){
-
-e.preventDefault();
-
-const form = new FormData(this);
-
-const message =
-document.getElementById(
-'uploadMessage'
-);
-
-message.innerHTML =
-'Uploading...';
-
-try{
-
-const data = await api(
-'/api/dataset/upload',
-{
-method:'POST',
-body:form
-}
-);
-
-message.innerHTML =
-'<div class="status successbox">' +
-escapeHtml(
-data.message ||
-'Upload successful'
-) +
-'</div>';
-
-this.reset();
-
-loadDataset();
-
-}catch(err){
-
-message.innerHTML =
-'<div class="status error">' +
-escapeHtml(err.message) +
-'</div>';
-
-}
-
-});
-
-
-async function loadDashboard(){
-
-try{
-
-const stats = await api(
-'/api/dataset/stats'
-);
-
-document.getElementById(
-'dashboardStats'
-).innerHTML = `
-
-<p>
-Training images:
-<strong>${stats.training_images}</strong>
-</p>
-
-<p>
-Training labels:
-<strong>${stats.training_labels}</strong>
-</p>
-
-<p>
-Validation images:
-<strong>${stats.validation_images}</strong>
-</p>
-
-`;
-
-}catch(e){
-
-console.error(e);
-
-}
-
-}
-
-
-async function startCamera(){
-
-try{
-
-cameraStream =
-await navigator.mediaDevices.getUserMedia({
-video:{
-facingMode:{
-ideal:'environment'
-}
-},
-audio:false
-});
-
-document.getElementById(
-'cameraVideo'
-).srcObject =
-cameraStream;
-
-}catch(e){
-
-alert(
-'Camera error: ' +
-e.message
-);
-
-}
-
-}
-
-
-function stopCamera(){
-
-if(cameraStream){
-
-cameraStream
-.getTracks()
-.forEach(
-track => track.stop()
-);
-
-cameraStream = null;
-
-document.getElementById(
-'cameraVideo'
-).srcObject = null;
-
-}
-
-}
-
-
-function escapeHtml(value){
-
-return String(value ?? '')
-.replaceAll('&','&amp;')
-.replaceAll('<','&lt;')
-.replaceAll('>','&gt;')
-.replaceAll('"','&quot;')
-.replaceAll("'","&#039;");
-
-}
-
-
-showTab('training');
-
-loadDataset();
-
-refreshTraining();
-
-setInterval(
-refreshTraining,
-1500
-);
-
-</script>
-
-</body>
-</html>
-"""
-
-
-# ============================================================
-# HTTP HANDLER
+# HTTP RESPONSE HELPERS
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
 
-    protocol_version = "HTTP/1.1"
+    server_version = "NEERIKA-BUCKET-AI/1.0"
 
     def log_message(
         self,
         format,
         *args
     ):
-
         print(
-            "%s - %s"
+            "%s - - [%s] %s"
             % (
                 self.address_string(),
+                self.log_date_time_string(),
                 format % args
             )
         )
 
-    # --------------------------------------------------------
-    # HEAD
-    # --------------------------------------------------------
+    def send_json(
+        self,
+        data,
+        status=200
+    ):
 
-    def do_HEAD(self):
+        body = json.dumps(
+            data,
+            ensure_ascii=False
+        ).encode("utf-8")
 
-        self.send_response(200)
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+
         self.send_header(
             "Content-Length",
-            "0"
+            str(len(body))
         )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store"
+        )
+
         self.end_headers()
 
-    # --------------------------------------------------------
+        self.wfile.write(body)
+
+    def send_html(
+        self,
+        html,
+        status=200
+    ):
+
+        body = html.encode(
+            "utf-8"
+        )
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def send_bytes(
+        self,
+        data,
+        content_type,
+        status=200
+    ):
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            content_type
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(data))
+        )
+
+        self.end_headers()
+
+        self.wfile.write(data)
+
+    # ========================================================
     # GET
-    # --------------------------------------------------------
+    # ========================================================
 
     def do_GET(self):
 
@@ -2295,233 +1270,260 @@ class Handler(BaseHTTPRequestHandler):
 
             path = parsed.path
 
-            query = parse_qs(
-                parsed.query
-            )
-
-            # --------------------------------------------
-            # HOME
-            # --------------------------------------------
-
             if path == "/":
-
-                html_response(
-                    self,
-                    HTML
+                self.send_html(
+                    MAIN_HTML
                 )
-
                 return
-
-            # --------------------------------------------
-            # TRAINING STATUS
-            # --------------------------------------------
 
             if path == "/api/training/status":
 
-                json_response(
-                    self,
-                    {
-                        **TRAINING_STATE
-                    }
-                )
+                self.send_json({
+                    **TRAINING_STATE,
+                    "model_exists":
+                        os.path.exists(
+                            MODEL_OUTPUT
+                        )
+                })
 
                 return
 
-            # --------------------------------------------
-            # DATASET STATS
-            # --------------------------------------------
-
             if path == "/api/dataset/stats":
 
-                json_response(
-                    self,
+                # Restore DB labels first.
+                restore_annotations_from_database()
+
+                self.send_json(
                     dataset_stats()
                 )
 
                 return
 
-            # --------------------------------------------
-            # DATASET IMAGES
-            # --------------------------------------------
-
             if path == "/api/dataset/images":
 
-                split = query.get(
-                    "split",
-                    ["train"]
-                )[0]
+                rows = []
 
-                if split not in [
+                for split in [
                     "train",
                     "val"
                 ]:
-                    split = "train"
 
-                json_response(
-                    self,
-                    {
-                        "split": split,
-                        "images": dataset_images(
+                    image_dir = (
+                        TRAIN_IMAGES_DIR
+                        if split == "train"
+                        else VAL_IMAGES_DIR
+                    )
+
+                    for filename in os.listdir(
+                        image_dir
+                    ):
+
+                        if not valid_image_filename(
+                            filename
+                        ):
+                            continue
+
+                        lp = label_path(
+                            filename,
                             split
                         )
-                    }
-                )
 
-                return
+                        annotation_count = 0
 
-            # --------------------------------------------
-            # IMAGE
-            # --------------------------------------------
-
-            if path == "/api/dataset/image":
-
-                split = query.get(
-                    "split",
-                    ["train"]
-                )[0]
-
-                filename = query.get(
-                    "filename",
-                    [""]
-                )[0]
-
-                file_path = image_path_for_split(
-                    split,
-                    filename
-                )
-
-                file_response(
-                    self,
-                    file_path
-                )
-
-                return
-
-            # --------------------------------------------
-            # LABELS GET
-            # --------------------------------------------
-
-            if path == "/api/dataset/labels":
-
-                split = query.get(
-                    "split",
-                    ["train"]
-                )[0]
-
-                filename = query.get(
-                    "filename",
-                    [""]
-                )[0]
-
-                label_path = label_path_for_split(
-                    split,
-                    filename
-                )
-
-                boxes = []
-
-                if os.path.exists(
-                    label_path
-                ):
-
-                    with open(
-                        label_path,
-                        "r",
-                        encoding="utf-8"
-                    ) as f:
-
-                        for line in f:
-
-                            parts = line.strip().split()
-
-                            if len(parts) < 5:
-                                continue
+                        if os.path.exists(lp):
 
                             try:
 
-                                cls = int(
-                                    float(parts[0])
-                                )
+                                with open(
+                                    lp,
+                                    "r",
+                                    encoding="utf-8"
+                                ) as f:
 
-                                x = float(parts[1])
-                                y = float(parts[2])
-                                w = float(parts[3])
-                                h = float(parts[4])
+                                    for line in f:
 
-                                boxes.append({
-                                    "class_id": cls,
-                                    "x": x,
-                                    "y": y,
-                                    "w": w,
-                                    "h": h
-                                })
+                                        if line.strip():
+                                            annotation_count += 1
 
                             except Exception:
-                                continue
+                                pass
 
-                json_response(
-                    self,
-                    {
-                        "filename": filename,
-                        "split": split,
-                        "boxes": boxes
-                    }
-                )
+                        rows.append({
+                            "filename": filename,
+                            "split": split,
+                            "annotations":
+                                annotation_count,
+                            "labeled":
+                                annotation_count > 0
+                        })
+
+                self.send_json({
+                    "images": rows
+                })
 
                 return
 
-            # --------------------------------------------
-            # MODEL
-            # --------------------------------------------
+            if path == "/api/dataset/image":
+
+                qs = parse_qs(
+                    parsed.query
+                )
+
+                filename = (
+                    qs.get(
+                        "filename",
+                        [""]
+                    )[0]
+                )
+
+                split = (
+                    qs.get(
+                        "split",
+                        ["train"]
+                    )[0]
+                )
+
+                filename = safe_filename(
+                    filename
+                )
+
+                full_path = image_path(
+                    filename,
+                    split
+                )
+
+                if not os.path.exists(
+                    full_path
+                ):
+
+                    self.send_json({
+                        "error":
+                            "Image not found"
+                    }, 404)
+
+                    return
+
+                with open(
+                    full_path,
+                    "rb"
+                ) as f:
+
+                    data = f.read()
+
+                encoded = base64.b64encode(
+                    data
+                ).decode("ascii")
+
+                ext = os.path.splitext(
+                    filename
+                )[1].lower()
+
+                mime = {
+                    ".jpg":
+                        "image/jpeg",
+                    ".jpeg":
+                        "image/jpeg",
+                    ".png":
+                        "image/png",
+                    ".webp":
+                        "image/webp"
+                }.get(
+                    ext,
+                    "application/octet-stream"
+                )
+
+                boxes = read_yolo_label_file(
+                    filename,
+                    split
+                )
+
+                self.send_json({
+                    "filename": filename,
+                    "split": split,
+                    "mime": mime,
+                    "data":
+                        "data:"
+                        + mime
+                        + ";base64,"
+                        + encoded,
+                    "boxes": boxes
+                })
+
+                return
+
+            if path == "/api/dataset/labels":
+
+                qs = parse_qs(
+                    parsed.query
+                )
+
+                filename = safe_filename(
+                    qs.get(
+                        "filename",
+                        [""]
+                    )[0]
+                )
+
+                split = qs.get(
+                    "split",
+                    ["train"]
+                )[0]
+
+                boxes = read_yolo_label_file(
+                    filename,
+                    split
+                )
+
+                self.send_json({
+                    "filename": filename,
+                    "split": split,
+                    "boxes": boxes,
+                    "count": len(boxes)
+                })
+
+                return
 
             if path == "/api/model":
 
-                if os.path.exists(
+                exists = os.path.exists(
                     MODEL_OUTPUT
-                ):
+                )
 
-                    json_response(
-                        self,
-                        {
-                            "exists": True,
-                            "path": MODEL_OUTPUT,
-                            "size": os.path.getsize(
-                                MODEL_OUTPUT
-                            )
-                        }
-                    )
+                size = 0
 
-                else:
+                if exists:
 
-                    json_response(
-                        self,
-                        {
-                            "exists": False
-                        }
-                    )
+                    try:
+                        size = os.path.getsize(
+                            MODEL_OUTPUT
+                        )
+                    except Exception:
+                        pass
+
+                self.send_json({
+                    "exists": exists,
+                    "path":
+                        "ai/models/bucket_best.pt",
+                    "size": size
+                })
 
                 return
 
-            self.send_error(
-                404,
-                "Not found"
-            )
+            self.send_json({
+                "error": "Not found"
+            }, 404)
 
         except Exception as e:
 
             traceback.print_exc()
 
-            json_response(
-                self,
-                {
-                    "error": str(e)
-                },
-                500
-            )
+            self.send_json({
+                "error": str(e)
+            }, 500)
 
-    # --------------------------------------------------------
+    # ========================================================
     # POST
-    # --------------------------------------------------------
+    # ========================================================
 
     def do_POST(self):
 
@@ -2533,606 +1535,2580 @@ class Handler(BaseHTTPRequestHandler):
 
             path = parsed.path
 
-            # --------------------------------------------
-            # START TRAINING
-            # --------------------------------------------
-
-            if path == "/api/training/start":
-
-                ok, message = start_training()
-
-                if ok:
-
-                    json_response(
-                        self,
-                        {
-                            "success": True,
-                            "message": message
-                        }
-                    )
-
-                else:
-
-                    json_response(
-                        self,
-                        {
-                            "success": False,
-                            "message": message
-                        },
-                        409
-                    )
-
-                return
-
-            # --------------------------------------------
-            # DATASET UPLOAD
-            # --------------------------------------------
-
             if path == "/api/dataset/upload":
 
-                fields, files = parse_multipart(
-                    self
-                )
-
-                upload = files.get(
-                    "image"
-                )
-
-                if not upload:
-
-                    json_response(
-                        self,
-                        {
-                            "error":
-                            "Image haijatumwa."
-                        },
-                        400
-                    )
-
-                    return
-
-                original = upload.get(
-                    "filename",
-                    "image.jpg"
-                )
-
-                filename = safe_filename(
-                    original
-                )
-
-                split = fields.get(
-                    "split",
-                    "train"
-                )
-
-                if split not in [
-                    "train",
-                    "val"
-                ]:
-                    split = "train"
-
-                # Add unique prefix so duplicate uploads
-                # don't overwrite each other.
-
-                base, ext = os.path.splitext(
-                    filename
-                )
-
-                unique_name = (
-                    f"{base}_"
-                    f"{datetime.now().strftime('%Y%m%d%H%M%S')}_"
-                    f"{uuid.uuid4().hex[:8]}"
-                    f"{ext.lower()}"
-                )
-
-                destination = image_path_for_split(
-                    split,
-                    unique_name
-                )
-
-                with open(
-                    destination,
-                    "wb"
-                ) as f:
-
-                    f.write(
-                        upload["content"]
-                    )
-
-                # Make sure corresponding label directory
-                # exists.
-
-                os.makedirs(
-                    os.path.dirname(
-                        label_path_for_split(
-                            split,
-                            unique_name
-                        )
-                    ),
-                    exist_ok=True
-                )
-
-                # Register in DB if possible.
-
-                if PSYCOPG2_AVAILABLE and DATABASE_URL:
-
-                    try:
-
-                        db_execute(
-                            """
-                            INSERT INTO training_dataset
-                            (filename, split, image_path,
-                             label_path, annotations)
-                            VALUES (%s,%s,%s,%s,%s)
-                            """,
-                            (
-                                unique_name,
-                                split,
-                                destination,
-                                label_path_for_split(
-                                    split,
-                                    unique_name
-                                ),
-                                0
-                            )
-                        )
-
-                    except Exception as db_error:
-
-                        print(
-                            "Dataset DB insert warning:",
-                            db_error
-                        )
-
-                json_response(
-                    self,
-                    {
-                        "success": True,
-                        "message": (
-                            "Image uploaded successfully. "
-                            "Sasa fungua image kwenye annotation "
-                            "workflow na save YOLO labels."
-                        ),
-                        "filename": unique_name,
-                        "split": split
-                    }
-                )
-
+                self.handle_upload()
                 return
-
-            # --------------------------------------------
-            # SAVE LABELS
-            # --------------------------------------------
 
             if path == "/api/dataset/labels":
 
-                length = int(
-                    self.headers.get(
-                        "Content-Length",
-                        "0"
-                    )
-                )
-
-                raw = self.rfile.read(
-                    length
-                )
-
-                data = json.loads(
-                    raw.decode(
-                        "utf-8"
-                    )
-                )
-
-                filename = safe_filename(
-                    data.get(
-                        "filename",
-                        ""
-                    )
-                )
-
-                split = data.get(
-                    "split",
-                    "train"
-                )
-
-                if split not in [
-                    "train",
-                    "val"
-                ]:
-                    split = "train"
-
-                boxes = data.get(
-                    "boxes",
-                    []
-                )
-
-                label_path = label_path_for_split(
-                    split,
-                    filename
-                )
-
-                image_path = image_path_for_split(
-                    split,
-                    filename
-                )
-
-                if not os.path.exists(
-                    image_path
-                ):
-
-                    json_response(
-                        self,
-                        {
-                            "error":
-                            "Image haipo kwenye dataset."
-                        },
-                        404
-                    )
-
-                    return
-
-                lines = []
-
-                for box in boxes:
-
-                    try:
-
-                        class_id = int(
-                            box.get(
-                                "class_id",
-                                CLASS_ID
-                            )
-                        )
-
-                        # Only BUCKET_LOADED class.
-                        class_id = CLASS_ID
-
-                        x = float(
-                            box["x"]
-                        )
-
-                        y = float(
-                            box["y"]
-                        )
-
-                        w = float(
-                            box["w"]
-                        )
-
-                        h = float(
-                            box["h"]
-                        )
-
-                        # Clamp normalized coordinates.
-
-                        x = max(
-                            0.0,
-                            min(
-                                1.0,
-                                x
-                            )
-                        )
-
-                        y = max(
-                            0.0,
-                            min(
-                                1.0,
-                                y
-                            )
-                        )
-
-                        w = max(
-                            0.0001,
-                            min(
-                                1.0,
-                                w
-                            )
-                        )
-
-                        h = max(
-                            0.0001,
-                            min(
-                                1.0,
-                                h
-                            )
-                        )
-
-                        lines.append(
-                            f"{class_id} "
-                            f"{x:.6f} "
-                            f"{y:.6f} "
-                            f"{w:.6f} "
-                            f"{h:.6f}"
-                        )
-
-                    except Exception:
-                        continue
-
-                # IMPORTANT:
-                # Write labels even if only one box.
-                # Training requires at least one valid class 0.
-
-                with open(
-                    label_path,
-                    "w",
-                    encoding="utf-8"
-                ) as f:
-
-                    if lines:
-                        f.write(
-                            "\n".join(lines)
-                            + "\n"
-                        )
-
-                annotation_count = len(
-                    lines
-                )
-
-                # Update database.
-
-                if PSYCOPG2_AVAILABLE and DATABASE_URL:
-
-                    try:
-
-                        existing = db_execute(
-                            """
-                            SELECT id
-                            FROM training_dataset
-                            WHERE filename=%s
-                            AND split=%s
-                            ORDER BY id DESC
-                            LIMIT 1
-                            """,
-                            (
-                                filename,
-                                split
-                            ),
-                            fetchone=True
-                        )
-
-                        if existing:
-
-                            db_execute(
-                                """
-                                UPDATE training_dataset
-                                SET annotations=%s,
-                                    image_path=%s,
-                                    label_path=%s
-                                WHERE id=%s
-                                """,
-                                (
-                                    annotation_count,
-                                    image_path,
-                                    label_path,
-                                    existing["id"]
-                                )
-                            )
-
-                        else:
-
-                            db_execute(
-                                """
-                                INSERT INTO training_dataset
-                                (filename, split,
-                                 image_path, label_path,
-                                 annotations)
-                                VALUES (%s,%s,%s,%s,%s)
-                                """,
-                                (
-                                    filename,
-                                    split,
-                                    image_path,
-                                    label_path,
-                                    annotation_count
-                                )
-                            )
-
-                    except Exception as db_error:
-
-                        print(
-                            "Label DB warning:",
-                            db_error
-                        )
-
-                if annotation_count == 0:
-
-                    json_response(
-                        self,
-                        {
-                            "success": False,
-                            "message":
-                            "Hakuna BUCKET_LOADED box iliyohifadhiwa.",
-                            "annotations": 0
-                        },
-                        400
-                    )
-
-                    return
-
-                json_response(
-                    self,
-                    {
-                        "success": True,
-                        "message":
-                        f"Saved successfully: "
-                        f"{os.path.basename(label_path)} | "
-                        f"{annotation_count} bucket(s).",
-                        "annotations":
-                        annotation_count
-                    }
-                )
-
+                self.handle_save_labels()
                 return
 
-            # --------------------------------------------
-            # BUCKET COUNT
-            # --------------------------------------------
+            if path == "/api/training/start":
+
+                self.handle_training_start()
+                return
 
             if path == "/api/count":
 
-                length = int(
-                    self.headers.get(
-                        "Content-Length",
-                        "0"
-                    )
-                )
-
-                raw = self.rfile.read(
-                    length
-                )
-
-                data = json.loads(
-                    raw.decode(
-                        "utf-8"
-                    )
-                )
-
-                bucket_type = data.get(
-                    "bucket_type",
-                    "BUCKET_LOADED"
-                )
-
-                shift = data.get(
-                    "shift",
-                    ""
-                )
-
-                operator_name = data.get(
-                    "operator_name",
-                    ""
-                )
-
-                count = int(
-                    data.get(
-                        "count",
-                        1
-                    )
-                )
-
-                if PSYCOPG2_AVAILABLE and DATABASE_URL:
-
-                    db_execute(
-                        """
-                        INSERT INTO bucket_counts
-                        (bucket_type,count,shift,operator_name)
-                        VALUES (%s,%s,%s,%s)
-                        """,
-                        (
-                            bucket_type,
-                            count,
-                            shift,
-                            operator_name
-                        )
-                    )
-
-                json_response(
-                    self,
-                    {
-                        "success": True,
-                        "message": "Bucket count saved."
-                    }
-                )
-
+                self.handle_count()
                 return
 
-            self.send_error(
-                404,
-                "Not found"
-            )
+            self.send_json({
+                "error": "Not found"
+            }, 404)
 
         except Exception as e:
 
             traceback.print_exc()
 
-            try:
+            self.send_json({
+                "error": str(e)
+            }, 500)
 
-                json_response(
-                    self,
-                    {
-                        "success": False,
-                        "error": str(e),
-                        "trace": traceback.format_exc()
-                    },
-                    500
+    # ========================================================
+    # BODY
+    # ========================================================
+
+    def read_body(self):
+
+        length = int(
+            self.headers.get(
+                "Content-Length",
+                "0"
+            )
+        )
+
+        if length > MAX_UPLOAD_SIZE:
+
+            raise ValueError(
+                "Upload too large"
+            )
+
+        return self.rfile.read(
+            length
+        )
+
+    # ========================================================
+    # JSON
+    # ========================================================
+
+    def read_json(self):
+
+        body = self.read_body()
+
+        if not body:
+            return {}
+
+        return json.loads(
+            body.decode("utf-8")
+        )
+
+    # ========================================================
+    # MULTIPART UPLOAD
+    # ========================================================
+
+    def handle_upload(self):
+
+        content_type = self.headers.get(
+            "Content-Type",
+            ""
+        )
+
+        if "multipart/form-data" not in content_type:
+
+            self.send_json({
+                "error":
+                    "multipart/form-data required"
+            }, 400)
+
+            return
+
+        boundary_token = None
+
+        for part in content_type.split(";"):
+
+            part = part.strip()
+
+            if part.startswith(
+                "boundary="
+            ):
+
+                boundary_token = (
+                    part.split(
+                        "=",
+                        1
+                    )[1]
                 )
 
-            except Exception:
-                pass
+        if not boundary_token:
+
+            self.send_json({
+                "error":
+                    "Multipart boundary missing"
+            }, 400)
+
+            return
+
+        if boundary_token.startswith('"'):
+            boundary_token = (
+                boundary_token
+                .strip('"')
+            )
+
+        body = self.read_body()
+
+        boundary = (
+            b"--"
+            + boundary_token.encode()
+        )
+
+        parts = body.split(
+            boundary
+        )
+
+        uploaded = []
+
+        for part in parts:
+
+            if (
+                not part
+                or part in [b"--", b"\r\n"]
+            ):
+                continue
+
+            header_end = part.find(
+                b"\r\n\r\n"
+            )
+
+            if header_end < 0:
+                continue
+
+            header_bytes = part[
+                :header_end
+            ]
+
+            data = part[
+                header_end + 4:
+            ]
+
+            if data.endswith(
+                b"\r\n"
+            ):
+                data = data[:-2]
+
+            headers = (
+                header_bytes
+                .decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+            )
+
+            if (
+                'name="image"'
+                not in headers
+            ):
+                continue
+
+            filename = None
+
+            marker = (
+                'filename="'
+            )
+
+            if marker in headers:
+
+                filename = (
+                    headers
+                    .split(
+                        marker,
+                        1
+                    )[1]
+                    .split(
+                        '"',
+                        1
+                    )[0]
+                )
+
+            if not filename:
+                continue
+
+            filename = safe_filename(
+                filename
+            )
+
+            if not valid_image_filename(
+                filename
+            ):
+
+                self.send_json({
+                    "error":
+                        "Only JPG, JPEG, PNG or WEBP images allowed."
+                }, 400)
+
+                return
+
+            # Avoid duplicate names.
+            stem, ext = os.path.splitext(
+                filename
+            )
+
+            final_filename = filename
+
+            counter = 1
+
+            while os.path.exists(
+                image_path(
+                    final_filename,
+                    "train"
+                )
+            ):
+
+                final_filename = (
+                    f"{stem}_{counter}{ext}"
+                )
+
+                counter += 1
+
+            target = image_path(
+                final_filename,
+                "train"
+            )
+
+            with open(
+                target,
+                "wb"
+            ) as f:
+
+                f.write(data)
+
+            # Make sure empty label does not
+            # falsely count as labeled.
+            lp = label_path(
+                final_filename,
+                "train"
+            )
+
+            if os.path.exists(lp):
+
+                try:
+                    os.remove(lp)
+                except Exception:
+                    pass
+
+            db_upsert_image(
+                final_filename,
+                "train",
+                0,
+                []
+            )
+
+            uploaded.append(
+                final_filename
+            )
+
+        if not uploaded:
+
+            self.send_json({
+                "error":
+                    "No image was uploaded."
+            }, 400)
+
+            return
+
+        self.send_json({
+            "success": True,
+            "message":
+                "Image uploaded successfully. "
+                "Fungua image kwenye annotation "
+                "workflow na chora BUCKET_LOADED.",
+            "files": uploaded
+        })
+
+    # ========================================================
+    # SAVE LABELS
+    # ========================================================
+
+    def handle_save_labels():
+
+        data = self.read_json()
+
+        filename = safe_filename(
+            data.get(
+                "filename",
+                ""
+            )
+        )
+
+        split = data.get(
+            "split",
+            "train"
+        )
+
+        boxes = data.get(
+            "boxes",
+            []
+        )
+
+        if split not in [
+            "train",
+            "val"
+        ]:
+
+            split = "train"
+
+        if not filename:
+
+            self.send_json({
+                "error":
+                    "Filename is required."
+            }, 400)
+
+            return
+
+        if not valid_image_filename(
+            filename
+        ):
+
+            self.send_json({
+                "error":
+                    "Invalid image filename."
+            }, 400)
+
+            return
+
+        full_image_path = image_path(
+            filename,
+            split
+        )
+
+        if not os.path.exists(
+            full_image_path
+        ):
+
+            self.send_json({
+                "error":
+                    "Image not found."
+            }, 404)
+
+            return
+
+        yolo_boxes = boxes_to_yolo(
+            boxes
+        )
+
+        if not yolo_boxes:
+
+            self.send_json({
+                "error":
+                    "Hakuna box iliyowekwa. "
+                    "Chora rectangle kuzunguka "
+                    "loaded bucket kwanza."
+            }, 400)
+
+            return
+
+        label_file, count = (
+            write_yolo_label_file(
+                filename,
+                boxes,
+                split
+            )
+        )
+
+        # Save annotation data permanently
+        # in Supabase too.
+        db_upsert_image(
+            filename,
+            split,
+            count,
+            boxes
+        )
+
+        self.send_json({
+            "success": True,
+            "message":
+                f"Saved successfully: "
+                f"{os.path.basename(label_file)} "
+                f"| {count} bucket(s).",
+            "filename": filename,
+            "split": split,
+            "annotations": count,
+            "label_file":
+                label_file
+        })
+
+    # ========================================================
+    # START TRAINING
+    # ========================================================
+
+    def handle_training_start():
+
+        if TRAINING_STATE["status"] in [
+            "preparing",
+            "loading",
+            "training",
+            "finalizing"
+        ]:
+
+            self.send_json({
+                "success": False,
+                "message":
+                    "Training is already running."
+            })
+
+            return
+
+        update_training(
+            status="preparing",
+            message="Training queued...",
+            progress=1,
+            epoch=0,
+            error=None
+        )
+
+        thread = threading.Thread(
+            target=training_worker,
+            daemon=True
+        )
+
+        thread.start()
+
+        self.send_json({
+            "success": True,
+            "message":
+                "Training started."
+        })
+
+    # ========================================================
+    # COUNT
+    # ========================================================
+
+    def handle_count():
+
+        data = self.read_json()
+
+        amount = int(
+            data.get(
+                "count",
+                1
+            )
+        )
+
+        amount = max(
+            1,
+            min(
+                amount,
+                100
+            )
+        )
+
+        bucket_type = str(
+            data.get(
+                "bucket_type",
+                "DEFAULT"
+            )
+        )
+
+        shift = str(
+            data.get(
+                "shift",
+                ""
+            )
+        )
+
+        conn = None
+
+        try:
+
+            conn = db_connect()
+
+            if conn is None:
+
+                self.send_json({
+                    "success": False,
+                    "error":
+                        "DATABASE_URL haijawekwa."
+                }, 500)
+
+                return
+
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO bucket_counts
+                    (
+                        bucket_type,
+                        count,
+                        shift,
+                        source
+                    )
+                VALUES
+                    (%s, %s, %s, %s)
+            """, (
+                bucket_type,
+                amount,
+                shift,
+                "camera"
+            ))
+
+            conn.commit()
+
+            cur.close()
+
+            self.send_json({
+                "success": True,
+                "count": amount
+            })
+
+        except Exception as e:
+
+            if conn:
+                conn.rollback()
+
+            self.send_json({
+                "success": False,
+                "error": str(e)
+            }, 500)
+
+        finally:
+
+            if conn:
+                conn.close()
 
 
 # ============================================================
-# START SERVER
+# FRONTEND
 # ============================================================
 
-print("=" * 60)
-print("NEERIKA BUCKET AI")
-print("Mining Production Bucket Counter")
-print("=" * 60)
+MAIN_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
 
-print(
-    "BASE_DIR:",
-    BASE_DIR
-)
+<head>
 
-print(
-    "DATASET_DIR:",
-    DATASET_DIR
-)
+<meta charset="UTF-8">
 
-print(
-    "MODEL_OUTPUT:",
-    MODEL_OUTPUT
-)
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
-print(
-    "YOLO_AVAILABLE:",
-    YOLO_AVAILABLE
-)
+<title>
+NEERIKA BUCKET AI
+</title>
 
-print(
-    "PSYCOPG2_AVAILABLE:",
-    PSYCOPG2_AVAILABLE
-)
+<style>
 
-print(
-    "CPU:",
-    DEVICE
-)
+* {
+    box-sizing: border-box;
+}
 
-print(
-    "IMAGE_SIZE:",
-    IMAGE_SIZE
-)
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f2f4f7;
+    color: #17202a;
+}
 
-print(
-    "BATCH_SIZE:",
-    BATCH_SIZE
-)
+header {
+    background: #111827;
+    color: white;
+    padding: 16px;
+}
 
-print(
-    "WORKERS:",
-    WORKERS
-)
+header h1 {
+    margin: 0;
+    font-size: 22px;
+}
 
-print(
-    "EPOCHS:",
-    EPOCHS
-)
+header p {
+    margin: 5px 0 0;
+    opacity: .8;
+}
 
-print(
-    "PORT:",
-    PORT
-)
+nav {
+    display: flex;
+    gap: 6px;
+    padding: 10px;
+    background: white;
+    overflow-x: auto;
+    border-bottom: 1px solid #ddd;
+}
 
-init_database()
+nav button {
+    border: 0;
+    padding: 10px 15px;
+    border-radius: 8px;
+    background: #e5e7eb;
+    cursor: pointer;
+    white-space: nowrap;
+}
 
-server = ThreadingHTTPServer(
-    ("0.0.0.0", PORT),
-    Handler
-)
+nav button.active {
+    background: #111827;
+    color: white;
+}
 
-print(
-    f"NEERIKA BUCKET AI running on port {PORT}"
-)
+main {
+    padding: 15px;
+    max-width: 1200px;
+    margin: auto;
+}
 
-server.serve_forever()
+.tab {
+    display: none;
+}
+
+.tab.active {
+    display: block;
+}
+
+.card {
+    background: white;
+    padding: 15px;
+    margin-bottom: 15px;
+    border-radius: 12px;
+    box-shadow:
+        0 2px 8px rgba(0,0,0,.08);
+}
+
+button {
+    cursor: pointer;
+}
+
+.primary {
+    background: #2563eb;
+    color: white;
+    border: 0;
+    padding: 11px 16px;
+    border-radius: 8px;
+}
+
+.success {
+    background: #16a34a;
+    color: white;
+    border: 0;
+    padding: 11px 16px;
+    border-radius: 8px;
+}
+
+.danger {
+    background: #dc2626;
+    color: white;
+    border: 0;
+    padding: 11px 16px;
+    border-radius: 8px;
+}
+
+.secondary {
+    background: #6b7280;
+    color: white;
+    border: 0;
+    padding: 11px 16px;
+    border-radius: 8px;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit,minmax(150px,1fr));
+    gap: 10px;
+}
+
+.stat {
+    background: #f8fafc;
+    padding: 15px;
+    border-radius: 10px;
+}
+
+.stat strong {
+    display: block;
+    font-size: 25px;
+    margin-top: 5px;
+}
+
+.progress {
+    width: 100%;
+    height: 18px;
+    background: #e5e7eb;
+    border-radius: 20px;
+    overflow: hidden;
+    margin-top: 10px;
+}
+
+.progress-bar {
+    height: 100%;
+    width: 0%;
+    background: #2563eb;
+    transition: width .3s;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    border-bottom: 1px solid #ddd;
+    padding: 9px;
+    text-align: left;
+}
+
+.small {
+    font-size: 13px;
+    color: #6b7280;
+}
+
+#annotationArea {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+    margin-top: 12px;
+    background: #111;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#annotationImage {
+    display: block;
+    max-width: 100%;
+    max-height: 65vh;
+    object-fit: contain;
+}
+
+#annotationCanvas {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+}
+
+.annotation-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+#selectedImageName {
+    font-weight: bold;
+    margin-top: 10px;
+}
+
+.message {
+    padding: 10px;
+    border-radius: 8px;
+    background: #eef2ff;
+    margin-top: 10px;
+}
+
+.camera-box {
+    text-align: center;
+}
+
+video {
+    width: 100%;
+    max-width: 700px;
+    background: black;
+    border-radius: 12px;
+}
+
+footer {
+    text-align: center;
+    padding: 25px;
+    color: #777;
+}
+
+.file-list button {
+    margin: 3px;
+}
+
+@media(max-width:600px) {
+
+    main {
+        padding: 9px;
+    }
+
+    table {
+        font-size: 12px;
+    }
+
+    .card {
+        padding: 11px;
+    }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+<h1>
+NEERIKA BUCKET AI
+</h1>
+
+<p>
+Mining Production Bucket Counter
+</p>
+
+</header>
+
+<nav>
+
+<button
+    class="tabBtn active"
+    onclick="showTab('dashboard',this)"
+>
+Dashboard
+</button>
+
+<button
+    class="tabBtn"
+    onclick="showTab('camera',this)"
+>
+Camera
+</button>
+
+<button
+    class="tabBtn"
+    onclick="showTab('buckets',this)"
+>
+Buckets
+</button>
+
+<button
+    class="tabBtn"
+    onclick="showTab('training',this)"
+>
+Training
+</button>
+
+<button
+    class="tabBtn"
+    onclick="showTab('history',this)"
+>
+History
+</button>
+
+<button
+    class="tabBtn"
+    onclick="showTab('settings',this)"
+>
+Settings
+</button>
+
+</nav>
+
+<main>
+
+<!-- =====================================================
+     DASHBOARD
+===================================================== -->
+
+<section
+    id="dashboard"
+    class="tab active"
+>
+
+<div class="card">
+
+<h2>
+Dashboard
+</h2>
+
+<div class="stats">
+
+<div class="stat">
+Training Images
+<strong id="dashTrainImages">0</strong>
+</div>
+
+<div class="stat">
+Training Labels
+<strong id="dashTrainLabels">0</strong>
+</div>
+
+<div class="stat">
+Unlabeled
+<strong id="dashUnlabeled">0</strong>
+</div>
+
+<div class="stat">
+Model
+<strong id="dashModel">No</strong>
+</div>
+
+</div>
+
+</div>
+
+</section>
+
+
+<!-- =====================================================
+     CAMERA
+===================================================== -->
+
+<section
+    id="camera"
+    class="tab"
+>
+
+<div class="card camera-box">
+
+<h2>
+Camera
+</h2>
+
+<video
+    id="cameraVideo"
+    autoplay
+    playsinline
+>
+</video>
+
+<br><br>
+
+<button
+    class="primary"
+    onclick="startCamera()"
+>
+Start Camera
+</button>
+
+<button
+    class="danger"
+    onclick="stopCamera()"
+>
+Stop Camera
+</button>
+
+<div
+    class="message"
+    id="cameraMessage"
+>
+Camera ready.
+</div>
+
+</div>
+
+</section>
+
+
+<!-- =====================================================
+     BUCKETS
+===================================================== -->
+
+<section
+    id="buckets"
+    class="tab"
+>
+
+<div class="card">
+
+<h2>
+Bucket Type
+</h2>
+
+<p>
+Active detection class:
+<strong>
+BUCKET_LOADED
+</strong>
+</p>
+
+<p class="small">
+Only loaded ore/material buckets should be
+annotated. Do not annotate empty buckets,
+people or equipment.
+</p>
+
+</div>
+
+</section>
+
+
+<!-- =====================================================
+     TRAINING
+===================================================== -->
+
+<section
+    id="training"
+    class="tab"
+>
+
+<div class="card">
+
+<h2>
+YOLO Training Dataset
+</h2>
+
+<p>
+Upload images and annotate them as
+<strong>
+BUCKET_LOADED
+</strong>.
+</p>
+
+<input
+    id="imageUpload"
+    type="file"
+    accept="image/jpeg,image/png,image/webp"
+>
+
+<br><br>
+
+<button
+    class="primary"
+    onclick="uploadImage()"
+>
+Upload Image
+</button>
+
+<div
+    id="uploadMessage"
+    class="message"
+>
+No file uploaded yet.
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Annotation Workflow
+</h3>
+
+<div
+    id="selectedImageName"
+>
+Chagua picha kwenye dataset hapa chini.
+</div>
+
+<div id="annotationArea">
+
+<img
+    id="annotationImage"
+    draggable="false"
+>
+
+<canvas
+    id="annotationCanvas"
+>
+</canvas>
+
+</div>
+
+<div class="annotation-controls">
+
+<button
+    class="secondary"
+    onclick="undoBox()"
+>
+Undo Last
+</button>
+
+<button
+    class="danger"
+    onclick="clearBoxes()"
+>
+Clear All
+</button>
+
+<button
+    class="success"
+    onclick="saveLabels()"
+>
+Save YOLO Labels
+</button>
+
+</div>
+
+<div
+    id="annotationMessage"
+    class="message"
+>
+Chagua image kisha chora rectangle
+kuzunguka loaded bucket.
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Training Status
+</h3>
+
+<p>
+Status:
+<strong id="trainingStatus">
+idle
+</strong>
+</p>
+
+<p id="trainingMessage">
+Ready
+</p>
+
+<div class="progress">
+
+<div
+    id="trainingProgress"
+    class="progress-bar"
+>
+</div>
+
+</div>
+
+<p>
+Epoch:
+<strong id="trainingEpoch">
+0
+</strong>
+/
+<span id="trainingEpochTotal">
+20
+</span>
+</p>
+
+<button
+    class="primary"
+    onclick="startTraining()"
+>
+Start Training
+</button>
+
+<button
+    class="secondary"
+    onclick="refreshTraining()"
+>
+Refresh
+</button>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Training Settings
+</h3>
+
+<div class="stats">
+
+<div class="stat">
+CPU
+<strong>CPU</strong>
+</div>
+
+<div class="stat">
+Image Size
+<strong>320</strong>
+</div>
+
+<div class="stat">
+Batch
+<strong>1</strong>
+</div>
+
+<div class="stat">
+Workers
+<strong>0</strong>
+</div>
+
+<div class="stat">
+Epochs
+<strong>20</strong>
+</div>
+
+</div>
+
+<p class="small">
+These settings are optimized for Render Free.
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Dataset
+</h3>
+
+<div
+    class="stats"
+    id="datasetStats"
+>
+</div>
+
+<br>
+
+<table>
+
+<thead>
+
+<tr>
+<th>Split</th>
+<th>Filename</th>
+<th>Annotations</th>
+<th>Action</th>
+</tr>
+
+</thead>
+
+<tbody
+    id="datasetTable"
+>
+</tbody>
+
+</table>
+
+</div>
+
+</section>
+
+
+<!-- =====================================================
+     HISTORY
+===================================================== -->
+
+<section
+    id="history"
+    class="tab"
+>
+
+<div class="card">
+
+<h2>
+History
+</h2>
+
+<p>
+Production bucket count history will appear
+here after counting is connected to the
+camera model.
+</p>
+
+</div>
+
+</section>
+
+
+<!-- =====================================================
+     SETTINGS
+===================================================== -->
+
+<section
+    id="settings"
+    class="tab"
+>
+
+<div class="card">
+
+<h2>
+Settings
+</h2>
+
+<p>
+Detection class:
+<strong>
+BUCKET_LOADED
+</strong>
+</p>
+
+<p>
+Image size:
+<strong>
+320
+</strong>
+</p>
+
+<p>
+Training device:
+<strong>
+CPU
+</strong>
+</p>
+
+<p>
+Workers:
+<strong>
+0
+</strong>
+</p>
+
+</div>
+
+</section>
+
+</main>
+
+
+<footer>
+Geology & Mining Services
+</footer>
+
+
+<script>
+
+/* =========================================================
+   GLOBAL STATE
+========================================================= */
+
+let currentFilename = "";
+let currentSplit = "train";
+
+let boxes = [];
+
+let drawing = false;
+
+let startX = 0;
+let startY = 0;
+
+let currentBox = null;
+
+let cameraStream = null;
+
+
+/* =========================================================
+   TAB
+========================================================= */
+
+function showTab(name, button) {
+
+    document
+        .querySelectorAll(".tab")
+        .forEach(function(tab) {
+            tab.classList.remove("active");
+        });
+
+    document
+        .querySelectorAll(".tabBtn")
+        .forEach(function(btn) {
+            btn.classList.remove("active");
+        });
+
+    const target =
+        document.getElementById(name);
+
+    if (target) {
+        target.classList.add("active");
+    }
+
+    if (button) {
+        button.classList.add("active");
+    }
+
+    if (name === "training") {
+        loadDataset();
+        refreshTraining();
+    }
+
+}
+
+
+/* =========================================================
+   UPLOAD
+========================================================= */
+
+async function uploadImage() {
+
+    const input =
+        document.getElementById(
+            "imageUpload"
+        );
+
+    const message =
+        document.getElementById(
+            "uploadMessage"
+        );
+
+    if (!input.files.length) {
+
+        message.textContent =
+            "Chagua picha kwanza.";
+
+        return;
+    }
+
+    const formData =
+        new FormData();
+
+    formData.append(
+        "image",
+        input.files[0]
+    );
+
+    message.textContent =
+        "Uploading...";
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/dataset/upload",
+                {
+                    method: "POST",
+                    body: formData
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Upload failed"
+            );
+        }
+
+        message.textContent =
+            data.message ||
+            "Image uploaded successfully.";
+
+        input.value = "";
+
+        await loadDataset();
+
+        if (
+            data.files &&
+            data.files.length
+        ) {
+
+            openImage(
+                data.files[0],
+                "train"
+            );
+
+        }
+
+    } catch (error) {
+
+        message.textContent =
+            "Upload error: "
+            + error.message;
+    }
+
+}
+
+
+/* =========================================================
+   DATASET
+========================================================= */
+
+async function loadDataset() {
+
+    try {
+
+        const statsResponse =
+            await fetch(
+                "/api/dataset/stats"
+            );
+
+        const stats =
+            await statsResponse.json();
+
+        document.getElementById(
+            "datasetStats"
+        ).innerHTML = `
+
+            <div class="stat">
+                Training Images
+                <strong>
+                    ${stats.training_images}
+                </strong>
+            </div>
+
+            <div class="stat">
+                Validation Images
+                <strong>
+                    ${stats.validation_images}
+                </strong>
+            </div>
+
+            <div class="stat">
+                Training Labels
+                <strong>
+                    ${stats.training_labels}
+                </strong>
+            </div>
+
+            <div class="stat">
+                Validation Labels
+                <strong>
+                    ${stats.validation_labels}
+                </strong>
+            </div>
+
+            <div class="stat">
+                Unlabeled Training
+                <strong>
+                    ${stats.unlabeled_training}
+                </strong>
+            </div>
+
+            <div class="stat">
+                Unlabeled Validation
+                <strong>
+                    ${stats.unlabeled_validation}
+                </strong>
+            </div>
+
+        `;
+
+        document.getElementById(
+            "dashTrainImages"
+        ).textContent =
+            stats.training_images;
+
+        document.getElementById(
+            "dashTrainLabels"
+        ).textContent =
+            stats.training_labels;
+
+        document.getElementById(
+            "dashUnlabeled"
+        ).textContent =
+            stats.unlabeled_training;
+
+
+        const response =
+            await fetch(
+                "/api/dataset/images"
+            );
+
+        const data =
+            await response.json();
+
+        const tbody =
+            document.getElementById(
+                "datasetTable"
+            );
+
+        tbody.innerHTML = "";
+
+        (data.images || [])
+            .forEach(function(item) {
+
+                const tr =
+                    document.createElement(
+                        "tr"
+                    );
+
+                tr.innerHTML = `
+
+                    <td>
+                        ${escapeHtml(
+                            item.split
+                        )}
+                    </td>
+
+                    <td>
+                        ${escapeHtml(
+                            item.filename
+                        )}
+                    </td>
+
+                    <td>
+                        ${item.annotations}
+                    </td>
+
+                    <td>
+
+                        <button
+                            class="primary"
+                            onclick='openImage(
+                                ${JSON.stringify(
+                                    item.filename
+                                )},
+                                ${JSON.stringify(
+                                    item.split
+                                )}
+                            )'
+                        >
+                            Annotate
+                        </button>
+
+                    </td>
+
+                `;
+
+                tbody.appendChild(tr);
+
+            });
+
+    } catch (error) {
+
+        console.error(
+            "Dataset error",
+            error
+        );
+    }
+
+}
+
+
+/* =========================================================
+   OPEN IMAGE
+========================================================= */
+
+async function openImage(
+    filename,
+    split
+) {
+
+    currentFilename =
+        filename;
+
+    currentSplit =
+        split || "train";
+
+    const message =
+        document.getElementById(
+            "annotationMessage"
+        );
+
+    message.textContent =
+        "Loading image...";
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/dataset/image"
+                + "?filename="
+                + encodeURIComponent(
+                    filename
+                )
+                + "&split="
+                + encodeURIComponent(
+                    currentSplit
+                )
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Image not found"
+            );
+        }
+
+        document.getElementById(
+            "selectedImageName"
+        ).textContent =
+            filename
+            + " | "
+            + currentSplit;
+
+        const img =
+            document.getElementById(
+                "annotationImage"
+            );
+
+        img.onload = function() {
+
+            resizeCanvas();
+
+            boxes = Array.isArray(
+                data.boxes
+            )
+                ? data.boxes
+                : [];
+
+            drawBoxes();
+
+            message.textContent =
+                "Chora rectangle kuzunguka "
+                + "BUCKET_LOADED. "
+                + "Box itabaki baada ya kutoa kidole.";
+
+        };
+
+        img.src =
+            data.data;
+
+    } catch (error) {
+
+        message.textContent =
+            "Image error: "
+            + error.message;
+    }
+
+}
+
+
+/* =========================================================
+   CANVAS
+========================================================= */
+
+const canvas =
+    document.getElementById(
+        "annotationCanvas"
+    );
+
+const ctx =
+    canvas.getContext(
+        "2d"
+    );
+
+const image =
+    document.getElementById(
+        "annotationImage"
+    );
+
+
+function resizeCanvas() {
+
+    if (!image.naturalWidth) {
+        return;
+    }
+
+    const rect =
+        image.getBoundingClientRect();
+
+    canvas.width =
+        image.clientWidth;
+
+    canvas.height =
+        image.clientHeight;
+
+    canvas.style.width =
+        image.clientWidth + "px";
+
+    canvas.style.height =
+        image.clientHeight + "px";
+
+    drawBoxes();
+}
+
+
+window.addEventListener(
+    "resize",
+    resizeCanvas
+);
+
+
+/* =========================================================
+   POINTER POSITION
+========================================================= */
+
+function getPointerPosition(event) {
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    let x =
+        event.clientX
+        - rect.left;
+
+    let y =
+        event.clientY
+        - rect.top;
+
+    x = Math.max(
+        0,
+        Math.min(
+            canvas.clientWidth,
+            x
+        )
+    );
+
+    y = Math.max(
+        0,
+        Math.min(
+            canvas.clientHeight,
+            y
+        )
+    );
+
+    return {
+        x: x,
+        y: y
+    };
+
+}
+
+
+/* =========================================================
+   POINTER DOWN
+========================================================= */
+
+canvas.addEventListener(
+    "pointerdown",
+    function(event) {
+
+        if (!currentFilename) {
+            return;
+        }
+
+        event.preventDefault();
+
+        canvas.setPointerCapture(
+            event.pointerId
+        );
+
+        const pos =
+            getPointerPosition(
+                event
+            );
+
+        startX =
+            pos.x;
+
+        startY =
+            pos.y;
+
+        currentBox = {
+            x: startX,
+            y: startY,
+            width: 0,
+            height: 0
+        };
+
+        drawing = true;
+
+    }
+);
+
+
+/* =========================================================
+   POINTER MOVE
+========================================================= */
+
+canvas.addEventListener(
+    "pointermove",
+    function(event) {
+
+        if (!drawing) {
+            return;
+        }
+
+        event.preventDefault();
+
+        const pos =
+            getPointerPosition(
+                event
+            );
+
+        let x =
+            Math.min(
+                startX,
+                pos.x
+            );
+
+        let y =
+            Math.min(
+                startY,
+                pos.y
+            );
+
+        let width =
+            Math.abs(
+                pos.x
+                - startX
+            );
+
+        let height =
+            Math.abs(
+                pos.y
+                - startY
+            );
+
+        currentBox = {
+            x: x,
+            y: y,
+            width: width,
+            height: height
+        };
+
+        drawBoxes();
+
+        drawCurrentBox();
+
+    }
+);
+
+
+/* =========================================================
+   POINTER UP
+========================================================= */
+
+canvas.addEventListener(
+    "pointerup",
+    finishDrawing
+);
+
+canvas.addEventListener(
+    "pointercancel",
+    finishDrawing
+);
+
+
+function finishDrawing(event) {
+
+    if (!drawing) {
+        return;
+    }
+
+    event.preventDefault();
+
+    drawing = false;
+
+    try {
+
+        canvas.releasePointerCapture(
+            event.pointerId
+        );
+
+    } catch (e) {}
+
+    if (
+        currentBox &&
+        currentBox.width >= 8 &&
+        currentBox.height >= 8
+    ) {
+
+        const normalized =
+            pixelBoxToNormalized(
+                currentBox
+            );
+
+        boxes.push(
+            normalized
+        );
+
+    }
+
+    currentBox = null;
+
+    drawBoxes();
+
+}
+
+
+/* =========================================================
+   PIXEL → NORMALIZED
+========================================================= */
+
+function pixelBoxToNormalized(
+    box
+) {
+
+    const width =
+        canvas.clientWidth;
+
+    const height =
+        canvas.clientHeight;
+
+    return {
+        x:
+            box.x / width,
+
+        y:
+            box.y / height,
+
+        width:
+            box.width / width,
+
+        height:
+            box.height / height,
+
+        class_id: 0
+    };
+
+}
+
+
+/* =========================================================
+   NORMALIZED → PIXEL
+========================================================= */
+
+function normalizedBoxToPixel(
+    box
+) {
+
+    return {
+        x:
+            box.x
+            * canvas.clientWidth,
+
+        y:
+            box.y
+            * canvas.clientHeight,
+
+        width:
+            box.width
+            * canvas.clientWidth,
+
+        height:
+            box.height
+            * canvas.clientHeight
+    };
+
+}
+
+
+/* =========================================================
+   DRAW BOXES
+========================================================= */
+
+function drawBoxes() {
+
+    ctx.clearRect(
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+    boxes.forEach(
+        function(box, index) {
+
+            const b =
+                normalizedBoxToPixel(
+                    box
+                );
+
+            ctx.lineWidth = 3;
+
+            ctx.strokeStyle =
+                "#00ff00";
+
+            ctx.strokeRect(
+                b.x,
+                b.y,
+                b.width,
+                b.height
+            );
+
+            ctx.fillStyle =
+                "rgba(0,255,0,.18)";
+
+            ctx.fillRect(
+                b.x,
+                b.y,
+                b.width,
+                b.height
+            );
+
+            ctx.fillStyle =
+                "#00ff00";
+
+            ctx.font =
+                "bold 16px Arial";
+
+            ctx.fillText(
+                "BUCKET_LOADED "
+                + (index + 1),
+                b.x + 5,
+                b.y + 20
+            );
+
+        }
+    );
+
+}
+
+
+/* =========================================================
+   DRAW CURRENT BOX
+========================================================= */
+
+function drawCurrentBox() {
+
+    if (!currentBox) {
+        return;
+    }
+
+    ctx.lineWidth = 3;
+
+    ctx.strokeStyle =
+        "#ffff00";
+
+    ctx.strokeRect(
+        currentBox.x,
+        currentBox.y,
+        currentBox.width,
+        currentBox.height
+    );
+
+}
+
+
+/* =========================================================
+   UNDO
+========================================================= */
+
+function undoBox() {
+
+    if (!boxes.length) {
+
+        document.getElementById(
+            "annotationMessage"
+        ).textContent =
+            "Hakuna box ya kuondoa.";
+
+        return;
+    }
+
+    boxes.pop();
+
+    drawBoxes();
+
+    document.getElementById(
+        "annotationMessage"
+    ).textContent =
+        "Box ya mwisho imeondolewa.";
+
+}
+
+
+/* =========================================================
+   CLEAR
+========================================================= */
+
+function clearBoxes() {
+
+    boxes = [];
+
+    drawBoxes();
+
+    document.getElementById(
+        "annotationMessage"
+    ).textContent =
+        "Boxes zote zimeondolewa. "
+        + "Chora tena kwenye bucket.";
+
+}
+
+
+/* =========================================================
+   SAVE LABELS
+========================================================= */
+
+async function saveLabels() {
+
+    const message =
+        document.getElementById(
+            "annotationMessage"
+        );
+
+    if (!currentFilename) {
+
+        message.textContent =
+            "Chagua image kwanza.";
+
+        return;
+    }
+
+    if (!boxes.length) {
+
+        message.textContent =
+            "Hakuna box. "
+            + "Chora rectangle kwenye loaded bucket.";
+
+        return;
+    }
+
+    message.textContent =
+        "Saving YOLO labels...";
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/dataset/labels",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        filename:
+                            currentFilename,
+
+                        split:
+                            currentSplit,
+
+                        boxes:
+                            boxes
+                    })
+                }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+
+            throw new Error(
+                data.error ||
+                "Save failed"
+            );
+        }
+
+        message.textContent =
+            data.message;
+
+        await loadDataset();
+
+    } catch (error) {
+
+        message.textContent =
+            "Save error: "
+            + error.message;
+    }
+
+}
+
+
+/* =========================================================
+   TRAINING
+========================================================= */
+
+async function startTraining() {
+
+    try {
+
+        const statsResponse =
+            await fetch(
+                "/api/dataset/stats"
+            );
+
+        const stats =
+            await statsResponse.json();
+
+        if (
+            stats.training_labels < 1
+        ) {
+
+            alert(
+                "Huwezi kuanza training. "
+                + "Training Labels = 0. "
+                + "Annotate image kwanza."
+            );
+
+            return;
+        }
+
+        const response =
+            await fetch(
+                "/api/training/start",
+                {
+                    method: "POST"
+                }
+            );
+
+        const data =
+            await response.json();
+
+        alert(
+            data.message ||
+            "Training started."
+        );
+
+        refreshTraining();
+
+    } catch (error) {
+
+        alert(
+            "Training error: "
+            + error.message
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   TRAINING STATUS
+========================================================= */
+
+async function refreshTraining() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/training/status"
+            );
+
+        const data =
+            await response.json();
+
+        document.getElementById(
+            "trainingStatus"
+        ).textContent =
+            data.status || "idle";
+
+        document.getElementById(
+            "trainingMessage"
+        ).textContent =
+            data.message || "Ready";
+
+        document.getElementById(
+            "trainingProgress"
+        ).style.width =
+            (
+                data.progress || 0
+            ) + "%";
+
+        document.getElementById(
+            "trainingEpoch"
+        ).textContent =
+            data.epoch || 0;
+
+        document.getElementById(
+            "trainingEpochTotal"
+        ).textContent =
+            data.epochs || 20;
+
+        document.getElementById(
+            "dashModel"
+        ).textContent =
+            data.model_exists
+                ? "Yes"
+                : "No";
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   AUTO STATUS POLLING
+========================================================= */
+
+setInterval(
+    refreshTraining,
+    3000
+);
+
+
+/* =========================================================
+   CAMERA
+========================================================= */
+
+async function startCamera() {
+
+    const video =
+        document.getElementById(
+            "cameraVideo"
+        );
+
+    const message =
+        document.getElementById(
+            "cameraMessage"
+        );
+
+    try {
+
+        cameraStream =
+            await navigator.mediaDevices
+                .getUserMedia({
+                    video: {
+                        facingMode:
+                            "environment"
+                    },
+                    audio: false
+                });
+
+        video.srcObject =
+            cameraStream;
+
+        message.textContent =
+            "Camera started.";
+
+    } catch (error) {
+
+        message.textContent =
+            "Camera error: "
+            + error.message;
+
+    }
+
+}
+
+
+function stopCamera() {
+
+    const video =
+        document.getElementById(
+            "cameraVideo"
+        );
+
+    if (cameraStream) {
+
+        cameraStream
+            .getTracks()
+            .forEach(
+                function(track) {
+                    track.stop();
+                }
+            );
+
+        cameraStream = null;
+    }
+
+    video.srcObject = null;
+
+    document.getElementById(
+        "cameraMessage"
+    ).textContent =
+        "Camera stopped.";
+
+}
+
+
+/* =========================================================
+   ESCAPE HTML
+========================================================= */
+
+function escapeHtml(
+    value
+) {
+
+    return String(value)
+        .replaceAll(
+            "&",
+            "&amp;"
+        )
+        .replaceAll(
+            "<",
+            "&lt;"
+        )
+        .replaceAll(
+            ">",
+            "&gt;"
+        )
+        .replaceAll(
+            '"',
+            "&quot;"
+        )
+        .replaceAll(
+            "'",
+            "&#039;"
+        );
+
+}
+
+
+/* =========================================================
+   INITIAL LOAD
+========================================================= */
+
+loadDataset();
+
+refreshTraining();
+
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# SERVER
+# ============================================================
+
+def run_server():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        Handler
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        "NEERIKA BUCKET AI"
+    )
+
+    print(
+        "Mining Production Bucket Counter"
+    )
+
+    print(
+        "Server running on port:",
+        port
+    )
+
+    print(
+        "YOLO_AVAILABLE:",
+        YOLO_AVAILABLE
+    )
+
+    print(
+        "POSTGRES_AVAILABLE:",
+        POSTGRES_AVAILABLE
+    )
+
+    print(
+        "EPOCHS:",
+        EPOCHS
+    )
+
+    print(
+        "IMAGE_SIZE:",
+        IMAGE_SIZE
+    )
+
+    print(
+        "BATCH_SIZE:",
+        BATCH_SIZE
+    )
+
+    print(
+        "WORKERS:",
+        WORKERS
+    )
+
+    print(
+        "=========================================="
+    )
+
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    run_server()
