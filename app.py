@@ -2735,15 +2735,22 @@ class MyWebsite(BaseHTTPRequestHandler):
 # =========================================================
 
 if __name__ == '__main__':
-    init_db()
+
+    print('NEERIKA MINE: starting...', flush=True)
 
     port = int(os.environ.get('PORT', '10000'))
+
+    print(f'NEERIKA MINE: PORT={port}', flush=True)
 
     server = ThreadingHTTPServer(
         ('0.0.0.0', port),
         MyWebsite
     )
 
-    print(f'NEERIKA MINE running on port {port}', flush=True)
+    print('NEERIKA MINE: server started', flush=True)
+
+    init_db()
+
+    print('NEERIKA MINE: database initialized', flush=True)
 
     server.serve_forever()
