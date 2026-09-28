@@ -4029,7 +4029,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="drilled_holes"
                 min="0"
                 step="1"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <label>
@@ -4041,7 +4042,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="charged_holes"
                 min="0"
                 step="1"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <label>
@@ -4053,7 +4055,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="nonels_used"
                 min="0"
                 step="1"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <label>
@@ -4065,7 +4068,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="buckets_used"
                 min="0"
                 step="1"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <label>
@@ -4077,7 +4081,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="fuel_used"
                 min="0"
                 step="0.01"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <label>
@@ -4089,7 +4094,8 @@ class MyWebsite(BaseHTTPRequestHandler):
                 name="total_length"
                 min="0"
                 step="0.01"
-                required>
+                placeholder="Acha wazi kama hakuna data">
+
 
 
             <button type="submit">
