@@ -3931,196 +3931,196 @@ class MyWebsite(BaseHTTPRequestHandler):
         )
 
 
-    # ========================================================
-# ADD DRILLING
-# ========================================================
-
-def add_drilling_form(self, u):
-
-    today = today_string()
-
-    content = f"""
-
-    <h1>
-        🕳️ Daily Drilling Report
-    </h1>
-
-    <div class="card">
-
-    <form
-        method="POST"
-        action="/add_drilling">
-
-        <label>
-            📅 Tarehe
-        </label>
-
-        <input
-            type="date"
-            name="report_date"
-            value="{today}"
-            required>
-
-
-        <label>
-            🔄 Shift
-        </label>
-
-        <select
-            name="shift"
-            required>
-
-            <option value="Day Shift">
-                ☀️ Day Shift
-            </option>
-
-            <option value="Night Shift">
-                🌙 Night Shift
-            </option>
-
-        </select>
-
-
-        <label>
-            🪨 Bits Used — pcs
-            <small>(Optional)</small>
-        </label>
-
-        <input
-            type="number"
-            name="bits_used"
-            min="0"
-            step="1"
-            placeholder="Acha wazi kama hakuna data">
-
-
-        <label>
-            🧵 Cortex Wire Used — meters
-            <small>(Optional)</small>
-        </label>
-
-        <input
-            type="number"
-            name="cortex_wire_used"
-            min="0"
-            step="0.01"
-            placeholder="Acha wazi kama hakuna data">
-
-
-        <label>
-            🔥 Fuse Used — pcs
-            <small>(Optional)</small>
-        </label>
-
-        <input
-            type="number"
-            name="fuse_used"
-            min="0"
-            step="1"
-            placeholder="Acha wazi kama hakuna data">
-
-
-        <label>
-            🕳️ Drilled Holes
-        </label>
-
-        <input
-            type="number"
-            name="drilled_holes"
-            min="0"
-            step="1"
-            required>
-
-
-        <label>
-            💥 Charged Holes
-        </label>
-
-        <input
-            type="number"
-            name="charged_holes"
-            min="0"
-            step="1"
-            required>
-
-
-        <label>
-            💣 Nonels
-        </label>
-
-        <input
-            type="number"
-            name="nonels_used"
-            min="0"
-            step="1"
-            required>
-
-
-        <label>
-            🪣 Buckets
-        </label>
-
-        <input
-            type="number"
-            name="buckets_used"
-            min="0"
-            step="1"
-            required>
-
-
-        <label>
-            ⛽ Fuel — PCS
-        </label>
-
-        <input
-            type="number"
-            name="fuel_used"
-            min="0"
-            step="0.01"
-            required>
-
-
-        <label>
-            📏 Drilling Length — FT
-        </label>
-
-        <input
-            type="number"
-            name="total_length"
-            min="0"
-            step="0.01"
-            required>
-
-
-        <button type="submit">
-            💾 Hifadhi Drilling Report
-        </button>
-
-    </form>
-
-    </div>
-
-
-    <br>
-
-    <a href="/dashboard">
-        ← Rudi Dashboard
-    </a>
-
-    """
-
-    self.send_html(
-        page(
-            "Add Drilling",
-            content,
-            u
-        )
-    )
-
-
-                    # ========================================================
-        # SAVE DRILLING
         # ========================================================
+    # ADD DRILLING
+    # ========================================================
+
+    def add_drilling_form(self, u):
+
+        today = today_string()
+
+        content = f"""
+
+        <h1>
+            🕳️ Daily Drilling Report
+        </h1>
+
+        <div class="card">
+
+        <form
+            method="POST"
+            action="/add_drilling">
+
+            <label>
+                📅 Tarehe
+            </label>
+
+            <input
+                type="date"
+                name="report_date"
+                value="{today}"
+                required>
+
+
+            <label>
+                🔄 Shift
+            </label>
+
+            <select
+                name="shift"
+                required>
+
+                <option value="Day Shift">
+                    ☀️ Day Shift
+                </option>
+
+                <option value="Night Shift">
+                    🌙 Night Shift
+                </option>
+
+            </select>
+
+
+            <label>
+                🪨 Bits Used — pcs
+                <small>(Optional)</small>
+            </label>
+
+            <input
+                type="number"
+                name="bits_used"
+                min="0"
+                step="1"
+                placeholder="Acha wazi kama hakuna data">
+
+
+            <label>
+                🧵 Cortex Wire Used — meters
+                <small>(Optional)</small>
+            </label>
+
+            <input
+                type="number"
+                name="cortex_wire_used"
+                min="0"
+                step="0.01"
+                placeholder="Acha wazi kama hakuna data">
+
+
+            <label>
+                🔥 Fuse Used — pcs
+                <small>(Optional)</small>
+            </label>
+
+            <input
+                type="number"
+                name="fuse_used"
+                min="0"
+                step="1"
+                placeholder="Acha wazi kama hakuna data">
+
+
+            <label>
+                🕳️ Drilled Holes
+            </label>
+
+            <input
+                type="number"
+                name="drilled_holes"
+                min="0"
+                step="1"
+                required>
+
+
+            <label>
+                💥 Charged Holes
+            </label>
+
+            <input
+                type="number"
+                name="charged_holes"
+                min="0"
+                step="1"
+                required>
+
+
+            <label>
+                💣 Nonels
+            </label>
+
+            <input
+                type="number"
+                name="nonels_used"
+                min="0"
+                step="1"
+                required>
+
+
+            <label>
+                🪣 Buckets
+            </label>
+
+            <input
+                type="number"
+                name="buckets_used"
+                min="0"
+                step="1"
+                required>
+
+
+            <label>
+                ⛽ Fuel — PCS
+            </label>
+
+            <input
+                type="number"
+                name="fuel_used"
+                min="0"
+                step="0.01"
+                required>
+
+
+            <label>
+                📏 Drilling Length — FT
+            </label>
+
+            <input
+                type="number"
+                name="total_length"
+                min="0"
+                step="0.01"
+                required>
+
+
+            <button type="submit">
+                💾 Hifadhi Drilling Report
+            </button>
+
+        </form>
+
+        </div>
+
+
+        <br>
+
+        <a href="/dashboard">
+            ← Rudi Dashboard
+        </a>
+
+        """
+
+        self.send_html(
+            page(
+                "Add Drilling",
+                content,
+                u
+            )
+        )
+
+
+    # ========================================================
+    # SAVE DRILLING
+    # ========================================================
 
     def save_drilling(self, data, u):
 
